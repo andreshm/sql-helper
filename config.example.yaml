@@ -1,0 +1,21 @@
+ai:
+  provider: ollama          # ollama | anthropic | openai | gemini
+
+  ollama:
+    base_url: http://localhost:11434
+    model: qwen2.5-coder:14b  # alternatives: qwen2.5-coder:32b, llama3.1:8b, deepseek-coder-v2:16b
+
+  anthropic:
+    api_key: ""             # or set ANTHROPIC_API_KEY env var
+    model: claude-sonnet-4-6
+
+  openai:
+    api_key: ""             # or set OPENAI_API_KEY env var
+    model: gpt-4o
+
+  gemini:
+    api_key: ""             # or set GEMINI_API_KEY env var
+    model: gemini-1.5-pro
+
+connections:                # Saved connection presets (optional)
+  []

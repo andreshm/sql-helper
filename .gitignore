@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments & Virtual Envs
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.*
+
+# Local Configurations & Secrets
+config.yaml
+.streamlit/secrets.toml
+app/db/saved_sessions.json
+.saved_sessions.json
+*.log
+
+# Database Files
+*.db
+*.sqlite
+*.sqlite3
+demo_ecommerce.db
+
+# IDE & Editor files
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+.DS_Store
+
+# Pytest / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
