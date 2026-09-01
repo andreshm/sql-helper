@@ -160,8 +160,41 @@ SELECT * FROM orders WHERE status = 'pending' AND customer_id = 42 ORDER BY crea
         self.assertEqual(recs[0]["table"], "orders")
         self.assertIn("CREATE INDEX", recs[0]["sql"])
 
+    def test_rollback_manager(self):
+        from app.db.rollback_manager import (
+            infer_rollback_sql,
+            record_index_change,
+            get_index_change_history,
+            clear_index_change_history,
+            generate_consolidated_rollback_script,
+        )
+
+        # 1. Test Drop -> Create rollback
+        drop_sql = "DROP INDEX `idx_orders_customer` ON `01_masterdb`.`orders`;"
+        act_type, rb_sql, desc = infer_rollback_sql("mysql", "01_masterdb", drop_sql, table="orders", columns=["customer_id"], index_name="idx_orders_customer")
+        self.assertEqual(act_type, "DROP INDEX")
+        self.assertIn("CREATE INDEX `idx_orders_customer` ON `01_masterdb`.`orders` (`customer_id`);", rb_sql)
+
+        # 2. Test Create -> Drop rollback
+        create_sql = "CREATE INDEX `idx_new_status` ON `orders` (`status`);"
+        act_type2, rb_sql2, desc2 = infer_rollback_sql("mysql", "01_masterdb", create_sql, table="orders", index_name="idx_new_status")
+        self.assertEqual(act_type2, "CREATE INDEX")
+        self.assertIn("DROP INDEX `idx_new_status`", rb_sql2)
+
+        # 3. Test recording and script generation
+        record_index_change("test_db", "orders", act_type, drop_sql, rb_sql, desc)
+        history = get_index_change_history("test_db")
+        self.assertTrue(len(history) >= 1)
+        self.assertEqual(history[0]["table"], "orders")
+
+        script = generate_consolidated_rollback_script("test_db")
+        self.assertIn("CREATE INDEX", script)
+
+        clear_index_change_history("test_db")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

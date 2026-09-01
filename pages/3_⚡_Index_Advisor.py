@@ -18,6 +18,13 @@ from app.db.performance_analyzer import (
     parse_uploaded_slow_query_log,
     recommend_indexes_for_slow_queries,
 )
+from app.db.rollback_manager import (
+    record_index_change,
+    get_index_change_history,
+    clear_index_change_history,
+    generate_consolidated_rollback_script,
+    infer_rollback_sql,
+)
 
 st.set_page_config(page_title="Index Advisor — SQL Helper", page_icon="⚡", layout="wide")
 apply_theme()
@@ -131,6 +138,7 @@ with tab_global:
                     "Table": item.get("table", ""),
                     "Category": item.get("type", cat),
                     "Index": item.get("index", ""),
+                    "Columns": item.get("columns", []),
                     "Reason": item.get("reason", ""),
                     "Action SQL": item.get("action", ""),
                 })
@@ -153,6 +161,7 @@ with tab_global:
             st.rerun()
 
         selected_sqls = []
+        selected_issue_objs = []
 
         for i, row in enumerate(all_issues):
             action_sql = row["Action SQL"]
@@ -173,6 +182,7 @@ with tab_global:
                         is_checked = st.checkbox("", key=chk_k)
                         if is_checked:
                             selected_sqls.append(action_sql)
+                            selected_issue_objs.append(row)
                 with r_col2:
                     badge_html = '<span class="badge-pill badge-success">✅ APPLIED</span>' if is_applied else f'<span class="badge-pill badge-warning">{row["Category"]}</span>'
                     st.markdown(f"**`{row['Table']}`** — `{row['Index']}` {badge_html}", unsafe_allow_html=True)
@@ -197,17 +207,27 @@ with tab_global:
             if do_apply and selected_sqls:
                 errors = []
                 with st.spinner("Applying selected index modifications…"):
-                    for stmt in selected_sqls:
+                    for stmt, row_obj in zip(selected_sqls, selected_issue_objs):
                         _, err, _ = execute_query(engine, stmt, database=selected_db)
                         if err:
                             errors.append(f"{stmt} -> {err}")
                         else:
                             st.session_state.executed_fixes.add(stmt)
+                            # Record rollback history
+                            act_type, rb_sql, desc = infer_rollback_sql(
+                                dialect, selected_db, stmt,
+                                table=row_obj.get("Table"),
+                                columns=row_obj.get("Columns"),
+                                index_name=row_obj.get("Index"),
+                            )
+                            record_index_change(selected_db, row_obj.get("Table"), act_type, stmt, rb_sql, desc)
+
                 if errors:
                     for e in errors:
                         st.error(e)
                 else:
-                    st.success(f"🎉 Successfully applied {len(selected_sqls)} index modifications!")
+                    st.success(f"🎉 Successfully applied {len(selected_sqls)} index modifications! 🛡️ Safety rollback scripts have been recorded in the Backups section below.")
+                    st.toast("🛡️ Rollback script available in Backups section!", icon="🛡️")
                     st.rerun()
 
         with b_c2:
@@ -325,7 +345,7 @@ with tab_slow:
                                 st.session_state[chk_t_key] = True
                             is_checked = st.checkbox("", key=chk_t_key)
                             if is_checked:
-                                selected_traffic_sqls.append(t_sql)
+                                selected_traffic_sqls.append((t_sql, tr))
 
                     with r2:
                         b_badge = '<span class="badge-pill badge-success">✅ APPLIED</span>' if is_applied else f'<span class="badge-pill badge-info">⚡ {tr["estimated_gain"]}</span>'
@@ -350,7 +370,14 @@ with tab_slow:
                                             st.error(f"Error: {err}")
                                         else:
                                             st.session_state.executed_fixes.add(t_sql)
-                                            st.success(f"✅ Created `{tr['index_name']}`!")
+                                            # Record rollback
+                                            act_type, rb_sql, desc = infer_rollback_sql(
+                                                dialect, selected_db, t_sql,
+                                                table=tr["table"], columns=tr["columns"], index_name=tr["index_name"]
+                                            )
+                                            record_index_change(selected_db, tr["table"], act_type, t_sql, rb_sql, desc)
+                                            st.success(f"✅ Created `{tr['index_name']}`! 🛡️ Rollback script saved in Backups section below.")
+                                            st.toast("🛡️ Rollback script saved in Backups section!", icon="🛡️")
                                             st.rerun()
                     st.write("")
 
@@ -409,11 +436,14 @@ with tab_ai:
                                 errors.append(f"{stmt} -> {err}")
                             else:
                                 st.session_state.executed_fixes.add(stmt)
+                                act_type, rb_sql, desc = infer_rollback_sql(dialect, selected_db, stmt, table=ai_target_table)
+                                record_index_change(selected_db, ai_target_table, act_type, stmt, rb_sql, desc)
                     if errors:
                         for e in errors:
                             st.error(e)
                     else:
-                        st.success(f"🎉 Successfully applied {len(selected_ai_sqls)} index modifications!")
+                        st.success(f"🎉 Successfully applied {len(selected_ai_sqls)} index modifications! 🛡️ Safety rollback recorded in Backups below.")
+                        st.toast("🛡️ Rollback script saved in Backups section!", icon="🛡️")
                         st.rerun()
             else:
                 st.warning("⚠️ Enable **'Execution Mode'** in the sidebar to execute selected fixes directly on the database.")
@@ -446,3 +476,66 @@ with tab_script:
         )
     else:
         st.info("No index modifications needed.")
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🛡️ Backups & Index Rollback Scripts Section (Bottom of Page)
+# ════════════════════════════════════════════════════════════════════════════
+st.write("")
+st.markdown("---")
+st.markdown("### 🛡️ Backups & Index Rollback Scripts")
+st.caption("Every index change executed through SQL Helper is automatically logged below with date, time, action description, and its exact inverse SQL rollback DDL.")
+
+rollback_history = get_index_change_history(selected_db)
+consolidated_rollback_sql = generate_consolidated_rollback_script(selected_db)
+
+rb_c1, rb_c2 = st.columns([3, 1])
+with rb_c1:
+    st.markdown(f"**Recorded Modifications on `{selected_db}`**: **{len(rollback_history)} operations**")
+with rb_c2:
+    if rollback_history:
+        st.download_button(
+            "⬇ Download Rollback Script (.sql)",
+            consolidated_rollback_sql,
+            file_name=f"{selected_db}_index_rollback.sql",
+            mime="text/plain",
+            use_container_width=True,
+            key="btn_dl_all_rollback_sql",
+        )
+
+if not rollback_history:
+    st.info("ℹ️ No index changes have been executed yet during this session. When you execute an index drop or creation above, its rollback script will automatically appear here.")
+else:
+    with st.expander(f"📜 View Complete Rollback Script ({len(rollback_history)} Operations)", expanded=False):
+        st.code(consolidated_rollback_sql, language="sql")
+
+    st.markdown("#### 📋 Detailed Change Log & 1-Click Rollback")
+    for item in rollback_history:
+        item_id = item["id"]
+        with st.container():
+            col_info_box, col_revert_btn = st.columns([12, 3])
+            with col_info_box:
+                action_badge = "🔴 DROPPED" if item["action_type"] == "DROP INDEX" else "🟢 CREATED"
+                st.markdown(f"**`{item['timestamp']}`** | **Table `{item['table']}`** | {action_badge} — *{item['description']}*")
+                st.caption(f"Executed: `{item['forward_sql']}`")
+                st.code(item["rollback_sql"], language="sql")
+            with col_revert_btn:
+                st.write("")
+                st.write("")
+                rev_label = "⏪ Rollback Fix" if is_test_db else "🔓 Rollback Fix"
+                if st.button(rev_label, key=f"btn_rb_{item_id}", use_container_width=True):
+                    if not is_test_db:
+                        st.session_state.is_test_db = True
+                    with st.spinner(f"Reverting index change on `{item['table']}`…"):
+                        _, rb_err, _ = execute_query(engine, item["rollback_sql"], database=selected_db)
+                        if rb_err:
+                            st.error(f"Rollback error: {rb_err}")
+                        else:
+                            st.success(f"🎉 Successfully restored index state on `{item['table']}`!")
+                            # Remove from executed fixes if present
+                            st.session_state.executed_fixes.discard(item["forward_sql"])
+                            st.rerun()
+            st.divider()
+
+    if st.button("🗑️ Clear Rollback History", key="btn_clear_rollback_hist"):
+        clear_index_change_history(selected_db)
+        st.rerun()
