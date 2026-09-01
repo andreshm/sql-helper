@@ -107,7 +107,7 @@ flowchart TD
 ### 1. Clone & Install
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/sql-helper.git
+git clone https://github.com/andreshm/sql-helper.git
 cd sql-helper
 
 # Create and activate a virtual environment
