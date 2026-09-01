@@ -436,10 +436,15 @@ def render_connection_sidebar():
                     """,
                     unsafe_allow_html=True,
                 )
-        else:
-            st.caption(f"🤖 AI: **{provider.upper()}** (`{configured_model}`)")
+        # ── 5. Safety & Backup Disclaimer ───────────────────────────────────
+        st.divider()
+        with st.expander("🛡️ Safety & Backup Notice", expanded=False):
+            st.caption(
+                "**MANDATORY NOTICE**: You are responsible for ensuring current, verified backups prior to executing DDL optimizations. "
+                "This tool is provided AS IS. The authors assume zero liability for data loss or downtime."
+            )
 
-        # ── 5. Shut Down / Quit Server Button ────────────────────────────────
+        # ── 6. Shut Down / Quit Server Button ────────────────────────────────
         st.divider()
         with st.popover("🛑 Quit Server", use_container_width=True):
             st.markdown("**Quit & Stop SQL Helper**")
@@ -453,3 +458,4 @@ def render_connection_sidebar():
                 st.success("Server stopped. You can close this browser window.")
                 time.sleep(0.5)
                 os._exit(0)
+

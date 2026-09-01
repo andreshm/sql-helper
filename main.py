@@ -73,6 +73,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ── Safety & Backup Mandatory Notice ─────────────────────────────────────────
+st.warning(
+    "⚠️ **CRITICAL DISCLAIMER & BACKUP REQUIREMENT**: SQL Helper executes direct schema modifications (`ALTER TABLE`, `MODIFY COLUMN`, `DROP INDEX`, and `VACUUM`). "
+    "**You MUST have a verified, restorable database backup before executing optimizations.** "
+    "This tool is provided *AS IS* without warranty of any kind. Authors and contributors accept zero liability for any data loss, schema alterations, or downtime."
+)
+
 engine = st.session_state.get("engine")
 
 # ════════════════════════════════════════════════════════════════════════════
