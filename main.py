@@ -13,7 +13,13 @@ from app.ui.components.connection_form import (
 from app.db.demo_db import generate_demo_database
 from app.db import schema_reader as sr
 from app.db.size_analyzer import get_database_storage_overview, format_bytes
-from app.db.connections import save_last_session, get_last_session, get_password
+from app.db.connections import (
+    save_last_session,
+    get_last_session,
+    get_password,
+    is_disclaimer_accepted,
+    set_disclaimer_accepted,
+)
 
 st.set_page_config(
     page_title="SQL Helper — Database Workspace",
@@ -73,12 +79,22 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Safety & Backup Mandatory Notice ─────────────────────────────────────────
-st.warning(
-    "⚠️ **CRITICAL DISCLAIMER & BACKUP REQUIREMENT**: SQL Helper executes direct schema modifications (`ALTER TABLE`, `MODIFY COLUMN`, `DROP INDEX`, and `VACUUM`). "
-    "**You MUST have a verified, restorable database backup before executing optimizations.** "
-    "This tool is provided *AS IS* without warranty of any kind. Authors and contributors accept zero liability for any data loss, schema alterations, or downtime."
-)
+# ── Safety & Backup Mandatory Notice (Dismissable) ───────────────────────────
+if not is_disclaimer_accepted() and not st.session_state.get("disclaimer_dismissed", False):
+    with st.container():
+        disc_c1, disc_c2 = st.columns([4, 1])
+        with disc_c1:
+            st.warning(
+                "⚠️ **CRITICAL DISCLAIMER & BACKUP REQUIREMENT**: SQL Helper executes direct schema modifications (`ALTER TABLE`, `MODIFY COLUMN`, `DROP INDEX`, and `VACUUM`). "
+                "**You MUST have a verified, restorable database backup before executing optimizations.** "
+                "This tool is provided *AS IS* without warranty of any kind. Authors and contributors accept zero liability for any data loss, schema alterations, or downtime."
+            )
+        with disc_c2:
+            st.write("")
+            if st.button("✅ I Agree & Understand\n*(Don't show again)*", use_container_width=True, key="btn_accept_disclaimer"):
+                set_disclaimer_accepted(True)
+                st.session_state.disclaimer_dismissed = True
+                st.rerun()
 
 engine = st.session_state.get("engine")
 

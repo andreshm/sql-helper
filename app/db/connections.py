@@ -152,3 +152,17 @@ def persist_active_database(database: str) -> None:
                 save_last_session(conn_id, database, tables)
     except Exception:
         pass
+
+
+def is_disclaimer_accepted() -> bool:
+    """Check if the user has accepted and dismissed the safety disclaimer."""
+    cfg = _read_config()
+    return bool(cfg.get("disclaimer_accepted", False))
+
+
+def set_disclaimer_accepted(accepted: bool = True) -> None:
+    """Persist user disclaimer acceptance in config.yaml."""
+    cfg = _read_config()
+    cfg["disclaimer_accepted"] = accepted
+    _write_config(cfg)
+
