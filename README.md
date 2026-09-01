@@ -70,14 +70,17 @@ Deterministic SQL profiling knows *what* numbers currently exist, but an LLM und
 * **Identifier Protection**: Flags columns like tracking numbers (UPS `1Z...`), barcodes, SKUs, or international postal codes that might only contain digits today but will receive letters tomorrow.
 * **Automatic Caution Unchecking**: Automatically unchecks risky migrations from the batch runner and attaches domain safety badges (`🛡️ AI Approved`, `⚠️ AI Caution`, `💡 AI Refinement`).
 
-### ⚡ 3. Dual-Engine Index Advisor with Austerity Convergence
+### ⚡ 3. Dual-Engine Index Advisor with Traffic & Slow Query Ingestion
+* **Live Performance Schema Ingestion**: Ingests slow queries directly from MySQL `sys.statement_analysis`, `performance_schema`, or uploaded `slow_query.log` files to synthesize composite indexes tailored to your production traffic.
 * **Static Rule Analysis**: Detects duplicate indexes, redundant composite prefixes, missing foreign key indexes, and low-cardinality indexes.
 * **Index Austerity Principle**: Enforces the DBA rule that *every unnecessary index pollutes buffer pool RAM and degrades write throughput*.
-* **Catalog Verification**: Cross-references every proposed action against the live database catalog to prevent Error 1091 (index already dropped).
 
-### 🧹 4. Smart Compaction & Defragmentation
-* **Targeted Smart Optimize**: Automatically scans for tables with significant fragmentation bloat ($\ge 1\text{ MB}$), allowing you to defragment only the fragmented tables in seconds rather than locking unfragmented tables for hours over remote connections.
-* **Live Byte Reclamation Tracker**: Measures exact before/after disk footprints to display storage reclaimed down to the byte.
+### 🧹 4. Smart Compaction & Automated Maintenance Scheduler
+* **Targeted Smart Optimize**: Automatically scans for tables with significant fragmentation bloat ($\ge 1\text{ MB}$), allowing you to defragment only the fragmented tables in seconds rather than locking unfragmented tables for hours.
+* **Crontab & Task Scheduler Generator**: Generates production-ready Linux cron jobs and Windows Task Scheduler scripts (`.bat`) to schedule automated off-peak maintenance windows.
+
+### 🗺️ 5. Interactive Schema ERD & Relationship Visualizer
+* **Visual Entity-Relationship Graphs**: Interactive Mermaid.js and Graphviz schema diagrams mapping primary keys, foreign key constraints, column datatypes, and table cardinality with selective filtering.
 
 ---
 
@@ -85,14 +88,15 @@ Deterministic SQL profiling knows *what* numbers currently exist, but an LLM und
 
 ```mermaid
 flowchart TD
-    A[Live Database: MySQL / PostgreSQL / SQLite] --> B[Server-Side SQL Profiling Engine]
-    B --> C[Phase 1: Fast Candidate Sampling]
-    C --> D[Phase 2: Exact Full-Table Aggregates]
+    A[Live Database: MySQL / PostgreSQL / SQLite] --> B[Server-Side SQL Profiling & Performance Engine]
+    B --> C[Phase 1: Fast Candidate Sampling & Slow Query Ingestion]
+    C --> D[Phase 2: Exact Full-Table Aggregates & Index Rules]
     D --> E[Single-Pass Optimization Synthesizer]
     E --> F[Local AI Semantic Risk Auditor]
     F --> G{Decision & Review}
     G -->|Interactive UI| H[1-Click Live Batch Execution]
-    G -->|Export| I[Downloadable .sql Migration Script]
+    G -->|Automate| S[Cron / Scheduled Maintenance Windows]
+    G -->|Export| I[Downloadable .sql Migration Script & ERD Graph]
     H --> J[Live Database: Optimized & Resized]
 ```
 
@@ -103,10 +107,10 @@ flowchart TD
 | # | Module | Key Capabilities |
 |---|---|---|
 | 1 | 📊 **Storage & Size Visualizer** | Interactive storage treemaps, table-by-table disk footprints, index vs data breakdown, and bloat rankings. |
-| 2 | 🧹 **Resize & Compaction** | Online InnoDB compaction (`OPTIMIZE TABLE`), `VACUUM`, WAL log compaction, and fast `ANALYZE TABLE` index statistics update. |
-| 3 | ⚡ **Index Advisor** | Detects duplicate indexes, redundant prefixes, missing foreign keys, and low-cardinality index waste + AI composite advice. |
+| 2 | 🧹 **Resize & Compaction** | Online InnoDB compaction (`OPTIMIZE TABLE`), `VACUUM`, WAL log compaction, and **Automated Maintenance Scheduler & Crontab Generator**. |
+| 3 | ⚡ **Index Advisor** | Detects duplicate indexes, redundant prefixes, missing foreign keys, plus **Slow Query Log & Performance Schema Ingestion**. |
 | 4 | 🔧 **Data Type Optimizer** | Database-wide column profiling, single-query execution buttons, empty-string sanitization, and AI risk audits. |
-| 5 | 🗂️ **Database Explorer** | Search & browse tables, views, procedures, triggers, foreign key constraints, and download formatted DDL. |
+| 5 | 🗂️ **Database Explorer & ERD** | Search & browse tables, views, procedures, foreign keys, and **Interactive Visual Entity-Relationship Diagrams (ERD)**. |
 | 6 | 📋 **Data Viewer** | High-performance paginated data grid with filters, row counters, and CSV/JSON exports. |
 | 7 | 🛠️ **Query Builder & Workbench** | SQL editor with execution plans (`EXPLAIN`), multi-statement support, and DML template generators. |
 | 8 | 🔒 **Security Analyzer** | Audit unencrypted sensitive columns, missing primary keys, dynamic SQL injection risks, and broad grants. |

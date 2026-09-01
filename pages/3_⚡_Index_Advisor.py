@@ -13,13 +13,18 @@ from app.ai.index_advisor import (
 )
 from app.ai.validator import extract_and_verify_sql_statements, verify_sql_against_schema
 from app.ai.provider import ask
+from app.db.performance_analyzer import (
+    fetch_live_slow_queries,
+    parse_uploaded_slow_query_log,
+    recommend_indexes_for_slow_queries,
+)
 
 st.set_page_config(page_title="Index Advisor — SQL Helper", page_icon="⚡", layout="wide")
 apply_theme()
 render_connection_sidebar()
 
-st.title("⚡ Dual-Engine Index Advisor & Health Workbench")
-st.caption("Deterministic static rules + local AI deep reasoning, safeguarded by live catalog anti-hallucination verification.")
+st.title("⚡ Dual-Engine Index Advisor & Performance Workbench")
+st.caption("Deterministic static rules + live slow query log ingestion + Local AI deep reasoning with catalog anti-hallucination verification.")
 
 engine = st.session_state.get("engine")
 if engine is None:
@@ -102,18 +107,19 @@ st.divider()
 if "executed_fixes" not in st.session_state:
     st.session_state.executed_fixes = set()
 
-tab_global, tab_table, tab_ai, tab_script = st.tabs([
+tab_global, tab_table, tab_slow, tab_ai, tab_script = st.tabs([
     "🌐 Database Issues & Fixes",
     "📋 Table Inspector",
+    "🐢 Slow Queries & Traffic Advisor",
     "🤖 Local AI Deep Advisor & Verifier",
     "📜 Batch Migration Script"
 ])
 
+all_actions = [item["action"] for items in global_findings.values() for item in items if item.get("action")]
+
 # ── Tab 1: Database-Wide Scan ────────────────────────────────────────────────
 with tab_global:
     st.markdown("### 🌐 Static Ground-Truth Index Findings")
-
-    all_actions = [item["action"] for items in global_findings.values() for item in items if item.get("action")]
 
     if total_issues == 0:
         st.success("🎉 **Clean Bill of Health!** No duplicate, redundant, or missing foreign key indexes detected.")
@@ -138,244 +144,269 @@ with tab_global:
         t1_col1, t1_col2, t1_col3 = st.columns([1, 1, 3])
         if t1_col1.button("☑️ Select All", key="static_sel_all", use_container_width=True):
             for i in range(len(all_issues)):
-                st.session_state[f"static_chk_{i}"] = True
+                st.session_state[f"chk_issue_{i}"] = True
             st.rerun()
 
         if t1_col2.button("⬜ Deselect All", key="static_desel_all", use_container_width=True):
             for i in range(len(all_issues)):
-                st.session_state[f"static_chk_{i}"] = False
+                st.session_state[f"chk_issue_{i}"] = False
             st.rerun()
 
-        selected_static_sqls = []
-        for i, issue in enumerate(all_issues):
-            sql_stmt = issue["Action SQL"]
-            is_applied = sql_stmt in st.session_state.executed_fixes
+        selected_sqls = []
+
+        for i, row in enumerate(all_issues):
+            action_sql = row["Action SQL"]
+            if not action_sql:
+                continue
+
+            is_applied = action_sql in st.session_state.executed_fixes
 
             with st.container():
-                row_c1, row_c2 = st.columns([1, 15])
-                with row_c1:
+                r_col1, r_col2 = st.columns([1, 15])
+                with r_col1:
                     if is_applied:
                         st.markdown("✅")
                     else:
-                        is_checked = st.checkbox("", value=True, key=f"static_chk_{i}")
+                        chk_k = f"chk_issue_{i}"
+                        if chk_k not in st.session_state:
+                            st.session_state[chk_k] = True
+                        is_checked = st.checkbox("", key=chk_k)
                         if is_checked:
-                            selected_static_sqls.append(sql_stmt)
-
-                with row_c2:
-                    cat_icon = "🗑️" if "DROP" in sql_stmt.upper() else "⚡"
-                    badge_html = '<span class="badge-pill badge-success">✅ APPLIED</span>' if is_applied else f'<span class="badge-pill badge-info">{issue["Category"]}</span>'
-                    st.markdown(f"**{cat_icon} `{issue['Table']}`** — `{issue['Index']}` {badge_html}", unsafe_allow_html=True)
-                    st.caption(issue["Reason"])
-                    st.code(sql_stmt, language="sql")
+                            selected_sqls.append(action_sql)
+                with r_col2:
+                    badge_html = '<span class="badge-pill badge-success">✅ APPLIED</span>' if is_applied else f'<span class="badge-pill badge-warning">{row["Category"]}</span>'
+                    st.markdown(f"**`{row['Table']}`** — `{row['Index']}` {badge_html}", unsafe_allow_html=True)
+                    st.caption(row["Reason"])
+                    st.code(action_sql, language="sql")
                 st.write("")
 
-        # Bottom Batch Execution Button
+        # Bottom Execution Toolbar
         st.write("")
-        if is_test_db:
-            btn_label = f"⚡ Apply Selected Fixes Now ({len(selected_static_sqls)})" if selected_static_sqls else "⚡ Apply Selected Fixes Now"
-            if st.button(btn_label, type="primary", use_container_width=True, key="apply_selected_static", disabled=not selected_static_sqls):
+        st.divider()
+        b_c1, b_c2 = st.columns([2, 3])
+        with b_c1:
+            if is_test_db:
+                btn_lbl = f"⚡ Apply Selected Fixes ({len(selected_sqls)})" if selected_sqls else "⚡ Apply Selected Fixes"
+                do_apply = st.button(btn_lbl, type="primary", use_container_width=True, key="apply_static_fixes", disabled=not selected_sqls)
+            else:
+                btn_lbl = f"🔓 Enable Execution & Apply Fixes ({len(selected_sqls)})" if selected_sqls else "🔓 Enable Execution & Apply Fixes"
+                do_apply = st.button(btn_lbl, type="primary", use_container_width=True, key="unlock_apply_static", disabled=not selected_sqls)
+                if do_apply:
+                    st.session_state.is_test_db = True
+
+            if do_apply and selected_sqls:
                 errors = []
-                with st.spinner(f"Executing {len(selected_static_sqls)} index modifications…"):
-                    for sql in selected_static_sqls:
-                        _, err, _ = execute_query(engine, sql, database=selected_db)
+                with st.spinner("Applying selected index modifications…"):
+                    for stmt in selected_sqls:
+                        _, err, _ = execute_query(engine, stmt, database=selected_db)
                         if err:
-                            if "1091" in err or "Can't DROP" in err or "no such index" in err:
-                                st.session_state.executed_fixes.add(sql)
-                            else:
-                                errors.append(f"{sql} -> {err}")
+                            errors.append(f"{stmt} -> {err}")
                         else:
-                            st.session_state.executed_fixes.add(sql)
+                            st.session_state.executed_fixes.add(stmt)
                 if errors:
                     for e in errors:
                         st.error(e)
                 else:
-                    st.success(f"🎉 Successfully applied {len(selected_static_sqls)} index modifications!")
+                    st.success(f"🎉 Successfully applied {len(selected_sqls)} index modifications!")
                     st.rerun()
-        else:
-            st.warning("⚠️ Enable **'Execution Mode'** in the sidebar to execute selected fixes directly on the database.")
 
-# ── Tab 2: Table Inspector ──────────────────────────────────────────────────
+        with b_c2:
+            if not is_test_db:
+                st.caption("🔒 **Execution Mode is OFF** (Read-Only Guardrail). Clicking above will enable execution mode and apply selected index modifications.")
+            else:
+                st.caption(f"⚡ **Execution Mode is ACTIVE**. Click above to apply all {len(selected_sqls)} selected DDL statements.")
+
+# ── Tab 2: Single Table Inspector ───────────────────────────────────────────
 with tab_table:
-    col_t1, col_t2 = st.columns([3, 1])
-    with col_t1:
-        target_tbl = st.selectbox("Select table to inspect", tables, key="idx_tbl_select")
+    st.markdown("### 📋 Table Index Inspector")
+    target_table = st.selectbox("Select table to inspect", tables, key="inspect_tbl")
 
-    if target_tbl:
-        try:
-            tbl_indexes = sr.get_indexes(engine, selected_db, target_tbl)
-            tbl_fks = sr.get_foreign_keys(engine, selected_db, target_tbl)
-            tbl_cols = sr.get_columns(engine, selected_db, target_tbl)
-            tbl_stats = sr.get_table_stats(engine, selected_db, target_tbl)
-        except Exception as e:
-            st.error(f"Error reading table details: {e}")
-            st.stop()
+    try:
+        existing_indexes = sr.get_indexes(engine, selected_db, target_table)
+        fks = sr.get_foreign_keys(engine, selected_db, target_table)
+    except Exception as e:
+        st.error(f"Error reading table indexes: {e}")
+        existing_indexes = []
+        fks = []
 
-        st.markdown(f"#### Existing Indexes on `{target_tbl}` ({len(tbl_indexes)})")
-        if tbl_indexes:
-            idx_df = pd.DataFrame([
-                {
-                    "Name": idx["name"],
-                    "Unique": "✓" if idx.get("unique") else "",
-                    "Columns": ", ".join(idx.get("columns", [])),
-                    "Type": idx.get("type", "BTREE"),
-                }
-                for idx in tbl_indexes
-            ])
-            st.dataframe(idx_df, use_container_width=True, hide_index=True)
+    st.markdown(f"#### Existing Indexes on `{target_table}` ({len(existing_indexes)})")
+    if existing_indexes:
+        idx_rows = []
+        for idx in existing_indexes:
+            idx_rows.append({
+                "Index Name": idx["name"],
+                "Unique": "✓" if idx.get("unique") else "",
+                "Type": idx.get("type", "BTREE"),
+                "Columns": ", ".join(idx.get("columns", [])),
+            })
+        st.dataframe(pd.DataFrame(idx_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info(f"No indexes found on `{target_table}`.")
+
+    # Table-Specific Static Issues
+    t_dups = [d for d in global_findings["duplicates"] if d.get("table") == target_table]
+    t_reds = [r for r in global_findings["redundant"] if r.get("table") == target_table]
+    t_fks = [f for f in global_findings["missing_fk"] if f.get("table") == target_table]
+
+    if t_dups or t_reds or t_fks:
+        st.markdown("#### Table-Specific Recommended Fixes")
+        for fix in t_dups + t_reds + t_fks:
+            st.warning(f"**[{fix.get('type')}]** {fix.get('reason')}")
+            st.code(fix.get("action", ""), language="sql")
+
+# ── Tab 3: Slow Queries & Traffic-Driven Advisor ────────────────────────────
+with tab_slow:
+    st.markdown("### 🐢 Slow Query Traffic & Performance Schema Ingestion")
+    st.caption("Ingest real-time slow queries and full table scans from server performance schema or upload a `slow_query.log` file to synthesize composite indexes.")
+
+    sq_c1, sq_c2 = st.columns([3, 2])
+    with sq_c1:
+        st.markdown("#### 1. Live Server Performance Ingestion")
+        live_btn = st.button("🔄 Pull Live Slow Queries from Server", type="primary", key="btn_pull_live_slow")
+    with sq_c2:
+        st.markdown("#### 2. Upload `slow_query.log` File")
+        uploaded_log = st.file_uploader("Drop MySQL Slow Query Log (.log, .txt)", type=["log", "txt"], key="upload_slow_log")
+
+    slow_queries_data = []
+
+    if live_btn or "cached_slow_queries" in st.session_state:
+        if live_btn:
+            with st.spinner("Querying server performance schema / sys table scans…"):
+                slow_queries_data = fetch_live_slow_queries(engine, selected_db, limit=20)
+                st.session_state.cached_slow_queries = slow_queries_data
         else:
-            st.warning("No indexes found on this table.")
+            slow_queries_data = st.session_state.get("cached_slow_queries", [])
 
-        local_issues = (
-            find_redundant_indexes(tbl_indexes, target_tbl, dialect, selected_db)
-            + find_missing_fk_indexes(tbl_indexes, tbl_fks, target_tbl, dialect, selected_db)
-            + find_low_cardinality_indexes(tbl_indexes, tbl_cols, target_tbl, dialect, selected_db)
-        )
+    if uploaded_log:
+        raw_text = uploaded_log.read().decode("utf-8", errors="ignore")
+        parsed_queries = parse_uploaded_slow_query_log(raw_text)
+        slow_queries_data = parsed_queries + slow_queries_data
+        st.success(f"📥 Successfully parsed {len(parsed_queries)} slow query entries from uploaded log!")
 
-        st.markdown("#### Table Findings & Actionable Fixes")
-        if not local_issues:
-            st.success(f"No deterministic index issues found on `{target_tbl}`.")
+    if not slow_queries_data:
+        st.info("💡 Click **'🔄 Pull Live Slow Queries'** or upload a slow query log file above to analyze real-world traffic patterns.")
+    else:
+        st.markdown(f"#### 🔍 Ingested Slow Queries ({len(slow_queries_data)})")
+        df_slow = pd.DataFrame([
+            {
+                "Query": q["query"][:80] + ("…" if len(q["query"]) > 80 else ""),
+                "Latency": q.get("total_latency", "N/A"),
+                "Exec Count": q.get("exec_count", 1),
+                "Full Scan": "⚠️ YES" if q.get("full_table_scan") else "NO",
+                "Avg Examined": f"{q.get('rows_examined_avg', 0):,.0f}",
+                "Avg Sent": f"{q.get('rows_sent_avg', 0):,.0f}",
+                "Inefficiency": f"{q.get('inefficiency_ratio', 1.0)}x",
+                "Source": q.get("source", "Server"),
+            }
+            for q in slow_queries_data
+        ])
+        st.dataframe(df_slow, use_container_width=True, hide_index=True)
+
+        # Generate Traffic-Driven Index Recommendations
+        st.markdown("#### ⚡ Traffic-Driven Composite Index Recommendations")
+        traffic_recs = recommend_indexes_for_slow_queries(slow_queries_data, dialect=dialect, existing_tables=tables)
+
+        if not traffic_recs:
+            st.info("No composite index opportunities identified from the current slow queries sample.")
         else:
-            selected_tbl_sqls = []
-            for j, issue in enumerate(local_issues):
-                sql_stmt = issue["action"]
-                is_applied = sql_stmt in st.session_state.executed_fixes
+            selected_traffic_sqls = []
+            for idx, tr in enumerate(traffic_recs):
+                t_sql = tr["sql"]
+                is_applied = t_sql in st.session_state.executed_fixes
 
-                r1, r2 = st.columns([1, 15])
-                with r1:
-                    if is_applied:
+                with st.container():
+                    r1, r2 = st.columns([1, 15])
+                    with r1:
+                        if is_applied:
+                            st.markdown("✅")
+                        else:
+                            chk_t_key = f"chk_traffic_idx_{idx}"
+                            if chk_t_key not in st.session_state:
+                                st.session_state[chk_t_key] = True
+                            is_checked = st.checkbox("", key=chk_t_key)
+                            if is_checked:
+                                selected_traffic_sqls.append(t_sql)
+
+                    with r2:
+                        b_badge = '<span class="badge-pill badge-success">✅ APPLIED</span>' if is_applied else f'<span class="badge-pill badge-info">⚡ {tr["estimated_gain"]}</span>'
+                        st.markdown(f"**Table `{tr['table']}`** — `{tr['index_name']}` ({', '.join(tr['columns'])}) {b_badge}", unsafe_allow_html=True)
+                        st.caption(f"{tr['reason']} | Trigger: `{tr['trigger_query']}`")
+                        
+                        code_c1, code_c2 = st.columns([12, 3])
+                        with code_c1:
+                            st.code(t_sql, language="sql")
+                        with code_c2:
+                            st.write("")
+                            if is_applied:
+                                st.button("✅ Applied", key=f"btn_traffic_run_{idx}", disabled=True, use_container_width=True)
+                            else:
+                                t_run_lbl = "▶️ Run Index" if is_test_db else "🔓 Run Index"
+                                if st.button(t_run_lbl, key=f"btn_traffic_run_{idx}", use_container_width=True):
+                                    if not is_test_db:
+                                        st.session_state.is_test_db = True
+                                    with st.spinner(f"Creating composite index on `{tr['table']}`…"):
+                                        _, err, _ = execute_query(engine, t_sql, database=selected_db)
+                                        if err:
+                                            st.error(f"Error: {err}")
+                                        else:
+                                            st.session_state.executed_fixes.add(t_sql)
+                                            st.success(f"✅ Created `{tr['index_name']}`!")
+                                            st.rerun()
+                    st.write("")
+
+# ── Tab 4: Local AI Deep Advisor ────────────────────────────────────────────
+with tab_ai:
+    st.markdown("### 🤖 Local AI Index Architect (Ollama / Cloud LLM)")
+    st.caption("Deep reasoning model analyzes query patterns, composite column selectivity, and real-world write penalties.")
+
+    ai_target_table = st.selectbox("Select table for AI deep reasoning", tables, key="ai_target_tbl")
+
+    if st.button(f"🧠 Consult AI Architect for `{ai_target_table}`", type="primary", use_container_width=True):
+        with st.spinner("AI Architect is evaluating column selectivity and query patterns…"):
+            try:
+                cols = sr.get_columns(engine, selected_db, ai_target_table)
+                idxs = sr.get_indexes(engine, selected_db, ai_target_table)
+                t_stats = sr.get_table_stats(engine, selected_db, ai_target_table)
+                sample_df = get_page(engine, selected_db, ai_target_table, page=0, page_size=5)
+                sample_rows = sample_df.to_dict(orient="records") if not sample_df.empty else []
+
+                prompt = build_index_prompt(dialect, ai_target_table, cols, idxs, t_stats, sample_rows)
+                raw_response = ask(cfg, prompt)
+                st.session_state[f"ai_idx_response_{ai_target_table}"] = raw_response
+            except Exception as e:
+                st.error(f"AI Index Advisor error: {e}")
+
+    if f"ai_idx_response_{ai_target_table}" in st.session_state:
+        raw_response = st.session_state[f"ai_idx_response_{ai_target_table}"]
+        verified_sqls, unverified_sqls = extract_and_verify_sql_statements(raw_response, engine, selected_db)
+
+        st.divider()
+
+        if verified_sqls:
+            st.markdown(f"#### 🛡️ AI Recommended Actions for `{ai_target_table}` (Catalog Verified)")
+            selected_ai_sqls = []
+            for idx, sql_stmt in enumerate(verified_sqls):
+                is_app = sql_stmt in st.session_state.executed_fixes
+                r_c1, r_c2 = st.columns([1, 15])
+                with r_c1:
+                    if is_app:
                         st.markdown("✅")
                     else:
-                        if st.checkbox("", value=True, key=f"tbl_chk_{target_tbl}_{j}"):
-                            selected_tbl_sqls.append(sql_stmt)
-
-                with r2:
-                    icon = "🗑️" if "DROP" in sql_stmt.upper() else "⚡"
-                    badge_html = '<span class="badge-pill badge-success">✅ APPLIED</span>' if is_applied else f'<span class="badge-pill badge-warning">{issue["type"]}</span>'
-                    st.markdown(f"**{icon} {issue['index']}** {badge_html}", unsafe_allow_html=True)
-                    st.caption(issue["reason"])
+                        if st.checkbox("", value=True, key=f"ai_chk_{ai_target_table}_{idx}"):
+                            selected_ai_sqls.append(sql_stmt)
+                with r_c2:
                     st.code(sql_stmt, language="sql")
                 st.write("")
 
             if is_test_db:
-                if st.button(f"⚡ Apply Selected Fixes for `{target_tbl}` ({len(selected_tbl_sqls)})", type="primary", use_container_width=True, key=f"apply_tbl_btn_{target_tbl}", disabled=not selected_tbl_sqls):
-                    for sql in selected_tbl_sqls:
-                        _, err, _ = execute_query(engine, sql, database=selected_db)
-                        if not err:
-                            st.session_state.executed_fixes.add(sql)
-                    st.success(f"Applied fixes for `{target_tbl}`!")
-                    st.rerun()
-            else:
-                st.caption("⚠️ Enable **'Test Mode'** in sidebar to execute.")
-
-# ── Tab 3: Local AI Advisor & Anti-Hallucination Verifier ───────────────────
-with tab_ai:
-    st.markdown("### 🤖 Local AI Deep Advisor & Verification Engine")
-    st.caption("AI analyzes multi-predicate patterns and composite indexes. All generated DDL is verified against the live catalog before presentation.")
-
-    ai_table = st.selectbox("Select table for AI deep analysis", tables, key="ai_idx_tbl")
-    ai_btn = st.button("✨ Run AI Analysis & Catalog Verification", type="primary", use_container_width=True)
-
-    if ai_btn and ai_table:
-        if "executed_fixes" in st.session_state:
-            st.session_state.executed_fixes.clear()
-        cols = sr.get_columns(engine, selected_db, ai_table)
-        idxs = sr.get_indexes(engine, selected_db, ai_table)
-        fks = sr.get_foreign_keys(engine, selected_db, ai_table)
-        stats = sr.get_table_stats(engine, selected_db, ai_table)
-        static_iss = (
-            find_redundant_indexes(idxs, columns=cols, table=ai_table, dialect=dialect, database=selected_db)
-            + find_missing_fk_indexes(idxs, fks, ai_table, dialect, selected_db)
-            + find_low_cardinality_indexes(idxs, cols, ai_table, dialect, selected_db)
-        )
-
-        prompt = build_index_prompt(dialect, ai_table, cols, idxs, fks, stats, static_iss)
-
-        with st.spinner("Consulting Local AI Database Architect…"):
-            response = ask(cfg, prompt)
-
-        st.session_state.ai_last_index_response = response
-        st.session_state.ai_last_table = ai_table
-
-    if "ai_last_index_response" in st.session_state and st.session_state.get("ai_last_table") == ai_table:
-        raw_response = st.session_state.ai_last_index_response
-        
-        # Verify all SQL statements in AI response against live schema (includes CREATE and DROP statements)
-        verified_stmts = extract_and_verify_sql_statements(engine, raw_response, database=selected_db, target_table=ai_table)
-
-        if verified_stmts:
-            st.markdown("#### 🛡️ Verified Actionable AI Recommendations")
-            st.caption("Check the optimizations you wish to apply, then click 'Apply Selected Fixes Now':")
-
-            # Selection Toolbar
-            s_col1, s_col2, s_col3 = st.columns([1, 1, 3])
-            if s_col1.button("☑️ Select All Verified", key="ai_sel_all", use_container_width=True):
-                for k, v_st in enumerate(verified_stmts):
-                    v_sql = v_st.get("sql", "")
-                    is_app = v_st.get("is_applied") or (v_sql in st.session_state.executed_fixes)
-                    if v_st.get("is_valid") and not is_app:
-                        st.session_state[f"ai_chk_{ai_table}_{k}"] = True
-                    else:
-                        st.session_state[f"ai_chk_{ai_table}_{k}"] = False
-                st.rerun()
-
-            if s_col2.button("⬜ Deselect All", key="ai_desel_all", use_container_width=True):
-                for k in range(len(verified_stmts)):
-                    st.session_state[f"ai_chk_{ai_table}_{k}"] = False
-                st.rerun()
-
-            selected_ai_sqls = []
-
-            for k, val_stmt in enumerate(verified_stmts):
-                sql = val_stmt.get("sql", "")
-                is_valid = val_stmt.get("is_valid", True)
-                is_applied = val_stmt.get("is_applied", False) or (sql in st.session_state.executed_fixes)
-                badge = "✅ Fix Applied Successfully" if is_applied else val_stmt.get("badge", "🛡️ Verified by Catalog")
-                badge_type = "success" if (is_applied or val_stmt.get("badge_type") == "success") else "danger"
-                action_type = val_stmt.get("action_type", "")
-
-                icon = "🗑️ DROP INDEX" if action_type == "DROP" or "DROP" in sql.upper() else "⚡ CREATE INDEX"
-                if "ALTER" in sql.upper(): icon = "🔧 ALTER TABLE"
-
-                with st.container():
-                    c_chk, c_body = st.columns([1, 15])
-                    with c_chk:
-                        if is_applied:
-                            st.markdown("✅")
-                        else:
-                            # Default checked only if valid and not applied
-                            default_chk = st.session_state.get(f"ai_chk_{ai_table}_{k}", is_valid)
-                            is_checked = st.checkbox("", value=default_chk, key=f"ai_chk_{ai_table}_{k}")
-                            if is_checked:
-                                selected_ai_sqls.append(sql)
-
-                    with c_body:
-                        b_class = "badge-success" if badge_type == "success" else "badge-danger"
-                        st.markdown(f"**{icon}** <span class=\"badge-pill {b_class}\">{badge}</span>", unsafe_allow_html=True)
-                        st.code(sql, language="sql")
-
-                        if is_applied:
-                            st.caption("✅ This index modification has already been executed on the live database.")
-                        elif val_stmt.get("issues"):
-                            for iss in val_stmt["issues"]:
-                                st.error(f"⚠️ {iss}")
-
-                    st.write("")
-
-            # Bottom Batch Execution Button for AI Recommendations
-            st.write("")
-            if is_test_db:
-                btn_label = f"⚡ Apply Selected Fixes Now ({len(selected_ai_sqls)})" if selected_ai_sqls else "⚡ Apply Selected Fixes Now"
-                if st.button(btn_label, type="primary", use_container_width=True, key=f"apply_selected_ai_{ai_table}", disabled=not selected_ai_sqls):
+                btn_ai_lbl = f"⚡ Apply Verified AI Index Fixes ({len(selected_ai_sqls)})" if selected_ai_sqls else "⚡ Apply Verified Fixes"
+                if st.button(btn_ai_lbl, type="primary", use_container_width=True, key="apply_ai_indexes", disabled=not selected_ai_sqls):
                     errors = []
-                    with st.spinner(f"Executing {len(selected_ai_sqls)} selected modifications…"):
+                    with st.spinner("Applying AI verified index modifications…"):
                         for stmt in selected_ai_sqls:
                             _, err, _ = execute_query(engine, stmt, database=selected_db)
                             if err:
-                                # If MySQL Error 1091 (index does not exist / already dropped), handle gracefully as clean
-                                if "1091" in err or "Can't DROP" in err or "no such index" in err:
-                                    st.session_state.executed_fixes.add(stmt)
-                                else:
-                                    errors.append(f"{stmt} -> {err}")
+                                errors.append(f"{stmt} -> {err}")
                             else:
                                 st.session_state.executed_fixes.add(stmt)
                     if errors:
@@ -392,7 +423,7 @@ with tab_ai:
         with st.expander("📖 Full AI Advisory Report", expanded=True):
             st.markdown(raw_response)
 
-# ── Tab 4: Batch Migration Script ───────────────────────────────────────────
+# ── Tab 5: Batch Migration Script ───────────────────────────────────────────
 with tab_script:
     st.markdown("### 📜 Batch Index Optimization Script")
     st.caption("Combined DDL script for dropping redundant indexes and creating missing foreign key indexes.")

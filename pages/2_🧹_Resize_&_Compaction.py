@@ -2,26 +2,35 @@ import streamlit as st
 import pandas as pd
 from app.ui.theme import apply_theme, render_metric_card
 from app.ui.components.connection_form import render_connection_sidebar
+from app.db import schema_reader as sr
 from app.db.size_analyzer import get_database_storage_overview, format_bytes
 from app.db.maintenance import run_maintenance_action, generate_maintenance_script
-from app.db import schema_reader as sr
+from app.db.scheduler import (
+    build_cron_expression,
+    generate_crontab_script,
+    generate_windows_task_script,
+    save_maintenance_job,
+    get_maintenance_jobs,
+    delete_maintenance_job,
+)
 
 st.set_page_config(page_title="Resize & Compaction — SQL Helper", page_icon="🧹", layout="wide")
 apply_theme()
 render_connection_sidebar()
 
-st.title("🧹 Database Resizing & Compaction Workbench")
-st.caption("Reclaim fragmented disk space, defragment table B-trees, shrink WAL logs, and run database-wide vacuuming.")
+st.title("🧹 Database Resizing, Compaction & Maintenance Scheduler")
+st.caption("Reclaim disk space, defragment table storage, eliminate unused freelist pages, and schedule recurring low-traffic maintenance windows.")
 
 engine = st.session_state.get("engine")
 if engine is None:
-    st.info("Connect to a database using the sidebar to run compaction and resizing.")
+    st.info("Connect to a database using the sidebar to run compaction actions.")
     st.stop()
 
 from app.db.connections import persist_active_database
 
 dialect = engine.dialect.name
 is_test_db = st.session_state.get("is_test_db", False)
+conn_info = st.session_state.get("connection_info", {})
 
 try:
     databases = sr.list_databases(engine)
@@ -44,7 +53,7 @@ if dialect != "sqlite" and len(databases) > 1:
             databases,
             index=databases.index(current_db) if current_db in databases else 0,
             label_visibility="collapsed",
-            key="resize_db_switch",
+            key="comp_db_switch",
         )
         if sel_db != current_db:
             st.session_state.selected_database = sel_db
@@ -57,29 +66,23 @@ try:
     overview = get_database_storage_overview(engine, selected_db)
     tables = [t["table"] for t in overview.get("tables", [])]
 except Exception as e:
-    st.error(f"Error reading storage: {e}")
+    st.error(f"Could not load storage overview: {e}")
     st.stop()
 
-# ── Summary Status Bar ──────────────────────────────────────────────────────
-c1, c2, c3 = st.columns(3)
-with c1:
-    render_metric_card("Current DB Size", format_bytes(overview["total_size_bytes"]), f"Engine: {dialect.upper()}", badge=dialect.upper(), badge_type="info")
-with c2:
-    reclaimable = overview["free_space_bytes"]
-    badge_t = "warning" if reclaimable > 0 else "success"
-    render_metric_card("Estimated Reclaimable", format_bytes(reclaimable), "Fragmentation & dead space", badge="Reclaimable", badge_type=badge_t)
-with c3:
-    render_metric_card("Tables Analyzed", str(len(tables)), "Ready for compaction", badge="Ready", badge_type="purple")
-
+# ── Safety Notice Banner ─────────────────────────────────────────────────────
 if not is_test_db:
-    guard_c1, guard_c2 = st.columns([4, 1])
-    with guard_c1:
-        st.warning("⚠️ **Safety Guardrail Active (Read-Only)**: Direct maintenance execution is locked to protect live databases. Click **'Enable Direct Execution'** or toggle in the sidebar to execute operations directly.")
-    with guard_c2:
-        st.write("")
-        if st.button("🔓 Enable Execution", type="primary", use_container_width=True, key="enable_compaction_exec"):
-            st.session_state.is_test_db = True
-            st.rerun()
+    with st.container():
+        g_col1, g_col2 = st.columns([4, 1])
+        with g_col1:
+            st.warning(
+                "🔒 **Read-Only Mode Active**: Compaction and maintenance operations directly rewrite database files on disk. "
+                "Enable **Execution Mode** below or in the sidebar to execute maintenance."
+            )
+        with g_col2:
+            st.write("")
+            if st.button("🔓 Enable Execution", type="primary", use_container_width=True, key="enable_compaction_exec"):
+                st.session_state.is_test_db = True
+                st.rerun()
 
 # ── Action Result Banner ─────────────────────────────────────────────────────
 if "last_maintenance_result" in st.session_state:
@@ -96,7 +99,12 @@ if "last_maintenance_result" in st.session_state:
     else:
         st.error(f"Compaction error: {res['error']}")
 
-tab_ops, tab_tables, tab_script = st.tabs(["🚀 Global Compaction", "📋 Table Defragmentation", "📜 Maintenance Script"])
+tab_ops, tab_tables, tab_script, tab_sched = st.tabs([
+    "🚀 Global Compaction",
+    "📋 Table Defragmentation",
+    "📜 Maintenance Script",
+    "⏱️ Maintenance Scheduler & Crontab",
+])
 
 # ── Tab 1: Global Compaction ────────────────────────────────────────────────
 with tab_ops:
@@ -183,94 +191,86 @@ with tab_ops:
                 st.session_state.last_maintenance_result = {
                     "success": True,
                     "formatted_reclaimed": "Statistics Refreshed",
-                    "reclaimed_percent": 0,
+                    "reclaimed_percent": 0.0,
                     "size_before_bytes": overview["total_size_bytes"],
                     "size_after_bytes": overview["total_size_bytes"],
-                    "sql_executed": f"ANALYZE TABLE across {len(tables)} tables;",
+                    "sql_executed": f"ANALYZE TABLE across all {len(tables)} tables;",
                 }
                 st.rerun()
 
-        # Display Top Fragmented Tables List
         if frag_tables:
-            st.markdown("##### 📋 Tables with Reclaimable Fragmentation")
+            st.markdown("##### 🔍 Fragmented Tables Breakdown")
             df_frag = pd.DataFrame([
                 {
                     "Table": t["table"],
-                    "Total Size": format_bytes(t["total_bytes"]),
-                    "Data Size": format_bytes(t["data_bytes"]),
-                    "Index Size": format_bytes(t["index_bytes"]),
-                    "Reclaimable Bloat (DATA_FREE)": format_bytes(t["free_bytes"]),
-                    "Rows": f"{t['rows']:,}",
+                    "Rows": f"{t.get('approx_rows', 0):,}",
+                    "Total Size": format_bytes(t.get("total_size_bytes", 0)),
+                    "Data Size": format_bytes(t.get("data_size_bytes", 0)),
+                    "Reclaimable Bloat": format_bytes(t.get("free_bytes", 0)),
+                    "Fragmentation %": f"{round((t.get('free_bytes', 0) / max(1, t.get('total_size_bytes', 1))) * 100, 1)}%",
                 }
                 for t in frag_tables
             ])
             st.dataframe(df_frag, use_container_width=True, hide_index=True)
 
-        with st.expander(f"⚠️ Full Rebuild Option (All {len(tables)} Tables — Slow on Remote Servers)", expanded=False):
-            st.caption("Rebuilds every single table from scratch, even if it has 0 MB of bloat. This can take a very long time on remote servers with limited disk I/O.")
-            if st.button(f"🧹 Force Rebuild All {len(tables)} Tables", use_container_width=True, disabled=not is_test_db, key="force_rebuild_all_mysql"):
-                ov_before = get_database_storage_overview(engine, selected_db)
-                size_before = ov_before["total_size_bytes"]
-                progress_bar = st.progress(0, text="Optimizing tables...")
-                for idx, tbl in enumerate(tables):
-                    progress_bar.progress((idx + 1) / len(tables), text=f"Optimizing `{tbl}` ({idx+1}/{len(tables)})…")
-                    run_maintenance_action(engine, "optimize_table", table=tbl, database=selected_db)
-                progress_bar.empty()
-                ov_after = get_database_storage_overview(engine, selected_db)
-                size_after = ov_after["total_size_bytes"]
-                reclaimed = max(0, size_before - size_after)
-                pct = round((reclaimed / size_before) * 100, 2) if size_before > 0 else 0
-                st.session_state.last_maintenance_result = {
-                    "success": True,
-                    "formatted_reclaimed": format_bytes(reclaimed) if reclaimed > 0 else "Defragmentation & Stats Complete",
-                    "reclaimed_percent": pct,
-                    "size_before_bytes": size_before,
-                    "size_after_bytes": size_after,
-                    "sql_executed": f"OPTIMIZE TABLE across {len(tables)} tables;",
-                }
-                st.rerun()
-
-    else:  # PostgreSQL
+    else:  # postgresql
         st.markdown(
             """
-            **PostgreSQL Compaction Actions:**
-            - **`VACUUM (ANALYZE)`**: Cleans dead tuples, updates visibility maps, and updates planner statistics.
-            - **`REINDEX TABLE`**: Rebuilds bloated B-tree indexes to minimize index size.
+            **PostgreSQL Maintenance Actions:**
+            - **`VACUUM`**: Reclaims storage occupied by dead tuples and marks space reusable.
+            - **`VACUUM FULL`**: Exclusively locks and rewrites tables to shrink physical files on disk back to operating system.
+            - **`ANALYZE`**: Collects optimizer statistics for query planning.
             """
         )
-        if st.button("🧹 VACUUM & Reindex All Tables", type="primary", use_container_width=True, disabled=not is_test_db):
-            with st.spinner("Running VACUUM across all tables…"):
-                for tbl in tables:
-                    run_maintenance_action(engine, "vacuum_table", table=tbl)
-                st.session_state.last_maintenance_result = {"success": True, "formatted_reclaimed": "Completed", "reclaimed_percent": 0, "size_before_bytes": 0, "size_after_bytes": 0, "sql_executed": "VACUUM (ANALYZE) ..."}
-                st.rerun()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🧹 Run VACUUM ANALYZE", type="primary", use_container_width=True, disabled=not is_test_db):
+                with st.spinner("Running VACUUM ANALYZE…"):
+                    res = run_maintenance_action(engine, "vacuum", database=selected_db)
+                    st.session_state.last_maintenance_result = res
+                    st.rerun()
+
+        with col2:
+            if st.button("⚡ Run VACUUM FULL (Shrink Disk)", use_container_width=True, disabled=not is_test_db):
+                with st.spinner("Running VACUUM FULL…"):
+                    res = run_maintenance_action(engine, "vacuum_full", database=selected_db)
+                    st.session_state.last_maintenance_result = res
+                    st.rerun()
 
 # ── Tab 2: Table Defragmentation ────────────────────────────────────────────
 with tab_tables:
-    st.markdown("### Individual Table Maintenance")
-    target_table = st.selectbox("Select table to defragment / optimize", tables)
+    st.markdown("### 📋 Table-by-Table Defragmentation")
+    st.caption("Target individual high-traffic tables to eliminate dead space without full database locks.")
 
-    if target_table:
-        tbl_info = next((t for t in overview.get("tables", []) if t["table"] == target_table), {})
-        
-        tc1, tc2, tc3, tc4 = st.columns(4)
-        tc1.metric("Rows", f"{tbl_info.get('rows', 0):,}")
-        tc2.metric("Data Size", format_bytes(tbl_info.get("data_bytes", 0)))
-        tc3.metric("Index Size", format_bytes(tbl_info.get("index_bytes", 0)))
-        tc4.metric("Status", tbl_info.get("health", "Healthy"))
+    if not tables:
+        st.info("No tables found to defragment.")
+    else:
+        target_table = st.selectbox("Select table to optimize", tables, key="defrag_target_tbl")
+        t_meta = next((t for t in overview.get("tables", []) if t["table"] == target_table), {})
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            render_metric_card("Total Size", format_bytes(t_meta.get("total_size_bytes", 0)), f"{t_meta.get('approx_rows', 0):,} rows", badge="Table Size", badge_type="purple")
+        with m2:
+            render_metric_card("Data Size", format_bytes(t_meta.get("data_size_bytes", 0)), "Table records", badge="Data", badge_type="info")
+        with m3:
+            render_metric_card("Index Size", format_bytes(t_meta.get("index_size_bytes", 0)), "B-Trees", badge="Indexes", badge_type="info")
+        with m4:
+            f_bytes = t_meta.get("free_bytes", 0)
+            render_metric_card("Reclaimable Bloat", format_bytes(f_bytes), "Dead space", badge="Reclaimable", badge_type="warning" if f_bytes > 1_000_000 else "success")
 
         st.write("")
         btn_c1, btn_c2 = st.columns(2)
 
         if dialect == "mysql":
             with btn_c1:
-                if st.button(f"🧹 OPTIMIZE `{target_table}`", type="primary", use_container_width=True, disabled=not is_test_db):
+                if st.button(f'🎯 OPTIMIZE TABLE "{target_table}"', type="primary", use_container_width=True, disabled=not is_test_db):
                     with st.spinner(f"Optimizing `{target_table}`…"):
                         res = run_maintenance_action(engine, "optimize_table", table=target_table, database=selected_db)
                         st.session_state.last_maintenance_result = res
                         st.rerun()
             with btn_c2:
-                if st.button(f"📊 ANALYZE `{target_table}`", use_container_width=True, disabled=not is_test_db):
+                if st.button(f'⚡ ANALYZE TABLE "{target_table}"', use_container_width=True, disabled=not is_test_db):
                     with st.spinner(f"Analyzing `{target_table}`…"):
                         res = run_maintenance_action(engine, "analyze_table", table=target_table, database=selected_db)
                         st.session_state.last_maintenance_result = res
@@ -311,3 +311,122 @@ with tab_script:
         mime="text/plain",
         use_container_width=True,
     )
+
+# ── Tab 4: Maintenance Scheduler & Crontab Generator ────────────────────────
+with tab_sched:
+    st.markdown("### ⏱️ Automated Maintenance Scheduler & Crontab Generator")
+    st.caption("Schedule low-traffic maintenance windows with ready-to-run Linux cron jobs, Windows Task Scheduler scripts, and saved job presets.")
+
+    sc_c1, sc_c2 = st.columns([2, 1])
+
+    with sc_c1:
+        st.markdown("#### 1. Configure Maintenance Window")
+        
+        col_f1, col_f2, col_f3 = st.columns(3)
+        with col_f1:
+            freq = st.selectbox("Schedule Frequency", ["Daily", "Weekly", "Monthly", "Hourly"], index=1, key="sched_freq")
+        with col_f2:
+            time_hour = st.number_input("Hour (24h)", min_value=0, max_value=23, value=3, help="Recommended: 02:00–04:00 AM off-peak", key="sched_hour")
+        with col_f3:
+            time_min = st.number_input("Minute", min_value=0, max_value=59, value=0, key="sched_min")
+
+        action_labels = {
+            "smart_optimize": "🎯 Smart Optimize Fragmented Tables Only (Recommended)",
+            "analyze_table": "⚡ Fast Optimizer Statistics Refresh Only (ANALYZE TABLE)",
+            "full_vacuum": "🧹 Full Table Rebuild & Vacuum"
+        }
+        chosen_action = st.selectbox("Maintenance Action", list(action_labels.keys()), format_func=lambda x: action_labels[x], key="sched_action")
+
+        cron_str = build_cron_expression(freq, hour=time_hour, minute=time_min)
+        st.info(f"Generated Cron Schedule Expression: **`{cron_str}`** (Runs at {time_hour:02d}:{time_min:02d} {freq})")
+
+    with sc_c2:
+        st.markdown("#### 2. Target Server Profile")
+        h_val = conn_info.get("host", "localhost")
+        p_val = conn_info.get("port", 3306 if dialect == "mysql" else 5432)
+        u_val = conn_info.get("user", "root")
+        st.markdown(f"* **Engine**: `{dialect.upper()}`\n* **Host**: `{h_val}:{p_val}`\n* **User**: `{u_val}`\n* **Database**: `{selected_db or 'All'}`")
+
+        if st.button("💾 Save Schedule to Presets", type="primary", use_container_width=True, key="btn_save_sched_job"):
+            job_obj = {
+                "dialect": dialect,
+                "database": selected_db,
+                "frequency": freq,
+                "cron_expression": cron_str,
+                "action": chosen_action,
+                "host": h_val,
+                "port": p_val,
+                "user": u_val,
+            }
+            save_maintenance_job(job_obj)
+            st.success("✅ Maintenance schedule preset saved successfully!")
+            st.rerun()
+
+    st.divider()
+
+    # Generator Viewers
+    gen_tab1, gen_tab2, gen_tab3 = st.tabs(["🐧 Linux / Crontab Script", "🪟 Windows Task Scheduler (.bat)", "📋 Active Saved Schedules"])
+
+    with gen_tab1:
+        st.markdown("##### 🐧 Linux Crontab & Bash Script")
+        st.caption("Copy this command into your server's crontab (`crontab -e`) or download the bash script:")
+        crontab_script = generate_crontab_script(
+            dialect=dialect,
+            host=conn_info.get("host", "localhost"),
+            port=conn_info.get("port", 3306 if dialect == "mysql" else 5432),
+            user=conn_info.get("user", "root"),
+            database=selected_db,
+            action=chosen_action,
+            cron_expr=cron_str,
+        )
+        st.code(f"{cron_str} /opt/scripts/sql_helper_maintenance.sh", language="bash")
+        st.code(crontab_script, language="bash")
+        st.download_button(
+            "⬇ Download sql_helper_maintenance.sh",
+            crontab_script,
+            file_name="sql_helper_maintenance.sh",
+            mime="text/x-sh",
+            key="btn_dl_crontab_sh",
+        )
+
+    with gen_tab2:
+        st.markdown("##### 🪟 Windows Task Scheduler (.bat)")
+        st.caption("Save this script and configure Windows Task Scheduler to run during your off-peak window:")
+        win_script = generate_windows_task_script(
+            dialect=dialect,
+            host=conn_info.get("host", "localhost"),
+            port=conn_info.get("port", 3306 if dialect == "mysql" else 5432),
+            user=conn_info.get("user", "root"),
+            database=selected_db,
+            action=chosen_action,
+        )
+        st.code(win_script, language="bat")
+        st.download_button(
+            "⬇ Download maintenance.bat",
+            win_script,
+            file_name="maintenance.bat",
+            mime="application/x-bat",
+            key="btn_dl_win_bat",
+        )
+
+    with gen_tab3:
+        st.markdown("##### 📋 Saved Recurring Maintenance Jobs")
+        saved_jobs = get_maintenance_jobs()
+        if not saved_jobs:
+            st.info("No saved maintenance schedules found. Configure and click 'Save Schedule to Presets' above.")
+        else:
+            for j in saved_jobs:
+                j_id = j.get("id", "")
+                with st.container():
+                    jc1, jc2, jc3, jc4 = st.columns([3, 2, 2, 1])
+                    with jc1:
+                        st.markdown(f"**`{j.get('database', 'All')}`** — `{action_labels.get(j.get('action', ''), j.get('action'))}`")
+                    with jc2:
+                        st.markdown(f"Schedule: **`{j.get('cron_expression')}`** ({j.get('frequency')})")
+                    with jc3:
+                        st.caption(f"Created: {j.get('created_at', '')}")
+                    with jc4:
+                        if st.button("🗑️ Delete", key=f"del_job_{j_id}", use_container_width=True):
+                            delete_maintenance_job(j_id)
+                            st.rerun()
+                    st.divider()

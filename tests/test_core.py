@@ -114,7 +114,54 @@ SUMMARY VERDICT: Review tracking_num before applying."""
         self.assertIn("tracking_num", parsed)
         self.assertEqual(parsed["tracking_num"]["status"], "CAUTION")
 
+    def test_erd_generator(self):
+        from app.db.erd_generator import generate_mermaid_erd, generate_graphviz_erd, get_schema_topology
+        topology = get_schema_topology(self.engine, "main")
+        self.assertIn("tables", topology)
+        self.assertIn("relationships", topology)
+
+        mermaid_code = generate_mermaid_erd(self.engine, "main")
+        self.assertIn("erDiagram", mermaid_code)
+
+        dot_code = generate_graphviz_erd(self.engine, "main")
+        self.assertIn("digraph ERD", dot_code)
+
+    def test_scheduler_and_crontab(self):
+        from app.db.scheduler import build_cron_expression, generate_crontab_script, generate_windows_task_script
+        cron_daily = build_cron_expression("Daily", hour=3, minute=15)
+        self.assertEqual(cron_daily, "15 3 * * *")
+
+        cron_weekly = build_cron_expression("Weekly", hour=4, minute=0, day_of_week=0)
+        self.assertEqual(cron_weekly, "0 4 * * 0")
+
+        sh_script = generate_crontab_script("mysql", host="127.0.0.1", port=3306, user="root", database="shop_db")
+        self.assertIn("mysqlcheck", sh_script)
+        self.assertIn("shop_db", sh_script)
+
+        bat_script = generate_windows_task_script("mysql", database="shop_db")
+        self.assertIn("mysqlcheck.exe", bat_script)
+
+    def test_performance_analyzer(self):
+        from app.db.performance_analyzer import parse_uploaded_slow_query_log, recommend_indexes_for_slow_queries
+        sample_log = """
+# Time: 2026-08-31T20:00:00.000000Z
+# User@Host: root[root] @ localhost []  Id:     3
+# Query_time: 3.450123  Lock_time: 0.000100 Rows_sent: 5  Rows_examined: 150000
+SET timestamp=1788137513;
+SELECT * FROM orders WHERE status = 'pending' AND customer_id = 42 ORDER BY created_at DESC;
+"""
+        parsed = parse_uploaded_slow_query_log(sample_log)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["rows_sent_avg"], 5.0)
+        self.assertEqual(parsed[0]["rows_examined_avg"], 150000.0)
+
+        recs = recommend_indexes_for_slow_queries(parsed, dialect="mysql", existing_tables=["orders", "customers"])
+        self.assertTrue(len(recs) >= 1)
+        self.assertEqual(recs[0]["table"], "orders")
+        self.assertIn("CREATE INDEX", recs[0]["sql"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
