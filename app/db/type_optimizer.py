@@ -1,14 +1,7 @@
 """
-Multi-Stage Data Type Optimizer & Storage Reducer Engine.
-Performs two-phase analysis:
-  Phase 1: Fast initial sample scan to identify candidate optimization targets.
-  Phase 2: Deep server-side SQL aggregate verification across 100% of table rows
-           (MIN, MAX, CHAR_LENGTH, Null counts, Empty counts, Numeric regex with Empty/NULL->0 treatment, Enum cardinality).
-
-Key Architecture:
-  - Single-Pass Convergence: Computes the ultimate unified end-state (Type + Shrink + Nullability + Sanitization) in one pass so you never need to re-run multiple times.
-  - Database-Wide Scanner: Evaluates all tables across the entire database at once.
-  - Full Safety Guardrails: Leading zeros, Auto-increment headroom, pre-flight nullability unlocking.
+Data Type Optimizer & Storage Footprint Reduction Engine.
+Profiles live database columns (sampling + deep verification) and generates single-pass,
+backward-compatible DDL migrations with strict 3-tier safety risk classification.
 """
 from __future__ import annotations
 import re
@@ -19,39 +12,19 @@ from app.db import schema_reader as sr
 from app.db.size_analyzer import format_bytes
 
 
-def scan_database_column_types(
-    engine: Engine,
-    database: str = "",
-    deep_verify: bool = True,
-    progress_callback: Any = None,
-) -> dict[str, list[dict]]:
-    """
-    Scans ALL tables in the database in a single sweep and returns all type optimizations grouped by table.
-    """
-    tables = sr.list_tables(engine, database)
-    all_suggestions: dict[str, list[dict]] = {}
-    total = len(tables)
-
-    for i, tbl in enumerate(tables):
-        if progress_callback:
-            progress_callback(i + 1, total, tbl)
-        suggs = profile_table_columns(engine, database, tbl, sample_limit=1000, deep_verify=deep_verify)
-        if suggs:
-            all_suggestions[tbl] = suggs
-
-    return all_suggestions
-
-
 def profile_table_columns(
     engine: Engine,
     database: str,
     table: str,
-    sample_limit: int = 1000,
+    sample_limit: int = 2000,
     deep_verify: bool = True,
 ) -> list[dict]:
     """
     Analyzes all columns in a table and produces complete, single-pass unified recommendations.
-    Combines base type downcasting, string shrinking, empty-string sanitization, and nullability tightening into a single DDL statement.
+    Enforces strict risk classification:
+      - 🟢 SAFE: Zero business growth risk (empty string sanitization, NOT NULL on fixed statuses, generous string shrinks).
+      - 🟡 MAYBE / CHECK GROWTH: Requires user confirmation (string shrinking on names/text, integer downcasts on growing tables).
+      - 🔴 HIGH RISK: ID/Sequence columns, code numbers, phone/zip/carrier numbers. Strictly unchecked by default.
     """
     dialect = engine.dialect.name
     columns = sr.get_columns(engine, database, table)
@@ -94,6 +67,32 @@ def profile_table_columns(
         series = sample_df[col_name].dropna()
         col_quoted = f"`{col_name}`" if dialect == "mysql" else f'"{col_name}"'
 
+        # Safety: Detect ID, Key, Sequence, or Foreign Key columns
+        is_id_column = (
+            is_pk or is_auto_inc or
+            bool(re.search(r"(^id$|_id$|^id_|_id_|^fld.*id$|^pk_)", col_name, re.IGNORECASE)) or
+            any(k in col_name.lower() for k in (
+                "client_id", "customer_id", "user_id", "ticket_id", "order_id", "invoice_id",
+                "record_id", "log_id", "account_id", "item_id", "emp_id", "employee_id",
+                "member_id", "parent_id", "guid", "uuid", "tracking_no", "tracking_num",
+                "order_no", "invoice_no", "sku", "barcode"
+            ))
+        )
+
+        is_flag_or_counter = any(k in col_name.lower() for k in (
+            "is_", "has_", "active", "enabled", "deleted", "flag", "status", "tier",
+            "level", "priority", "count", "qty", "points", "attempts", "retry"
+        ))
+
+        is_text_content = any(k in col_name.lower() for k in (
+            "name", "title", "desc", "addr", "comment", "note", "reason", "message",
+            "url", "email", "body", "text", "company", "city", "state", "country", "street"
+        ))
+
+        is_phone_or_zip = any(k in col_name.lower() for k in (
+            "phone", "tel", "mobile", "fax", "zip", "postal", "ssn", "pin", "barcode", "card", "tax_id"
+        ))
+
         # Baseline metrics
         target_base_type = col_type
         target_bytes = current_bytes
@@ -101,6 +100,8 @@ def profile_table_columns(
         reason_parts = []
         pre_sql = ""
         verification_badge = "Sampled Profile"
+        risk_level = "SAFE"
+        risk_badge = "🟢 Safe & Confirmed"
 
         null_count = 0
         empty_count = 0
@@ -127,49 +128,53 @@ def profile_table_columns(
             else:
                 null_count = sample_size - len(series)
 
-            # Integer Downcasting Evaluation
-            if is_auto_inc:
+            # Integer Downcasting Evaluation with Strict ID / Growth Protection
+            if is_id_column:
+                # NEVER downcast ID columns to TINYINT, SMALLINT, or MEDIUMINT!
                 if "BIGINT" in col_type and 0 <= min_val and max_val <= 2000000000:
                     target_base_type = "INT UNSIGNED" if dialect == "mysql" else "INTEGER"
                     target_bytes = 4
-                    category = "Integer Downcast (Auto-Inc Protected)"
-                    reason_parts.append(f"Range [{min_val:,} to {max_val:,}] fits safely in INT UNSIGNED with 4.29B growth capacity.")
+                    category = "Integer Downcast (ID Capacity Protected)"
+                    risk_level = "MAYBE"
+                    risk_badge = "🟡 Check Growth"
+                    reason_parts.append(f"ID sequence [{min_val:,} to {max_val:,}] fits safely in INT UNSIGNED (4.29B capacity). Verify long-term ID volume.")
+            elif is_flag_or_counter:
+                if 0 <= min_val and max_val <= 255:
+                    target_base_type = "TINYINT UNSIGNED" if dialect == "mysql" else "SMALLINT"
+                    target_bytes = 1 if dialect == "mysql" else 2
+                    category = "Status Flag Optimization"
+                    risk_level = "SAFE"
+                    risk_badge = "🟢 Safe & Confirmed"
+                    reason_parts.append(f"Status/flag column values [{min_val:,} to {max_val:,}] fit in 1-byte TINYINT.")
+                elif 0 <= min_val and max_val <= 65535:
+                    target_base_type = "SMALLINT UNSIGNED" if dialect == "mysql" else "SMALLINT"
+                    target_bytes = 2
+                    category = "Small Counter Optimization"
+                    risk_level = "SAFE"
+                    risk_badge = "🟢 Safe & Confirmed"
+                    reason_parts.append(f"Counter values [{min_val:,} to {max_val:,}] fit in SMALLINT.")
             elif "BIGINT" in col_type or ("INT" in col_type and "TINY" not in col_type and "SMALL" not in col_type):
                 if 0 <= min_val and max_val <= 255:
                     target_base_type = "TINYINT UNSIGNED" if dialect == "mysql" else "SMALLINT"
                     target_bytes = 1 if dialect == "mysql" else 2
                     category = "Integer Downcast"
-                    reason_parts.append(f"Values range from {min_val:,} to {max_val:,} (fits in TINYINT).")
-                elif -128 <= min_val and max_val <= 127:
-                    target_base_type = "TINYINT" if dialect == "mysql" else "SMALLINT"
-                    target_bytes = 1 if dialect == "mysql" else 2
-                    category = "Integer Downcast"
-                    reason_parts.append(f"Values range from {min_val:,} to {max_val:,} (fits in TINYINT).")
+                    risk_level = "MAYBE"
+                    risk_badge = "🟡 Check Growth"
+                    reason_parts.append(f"Values currently range from {min_val:,} to {max_val:,}. Verify future values will not exceed 255.")
                 elif 0 <= min_val and max_val <= 65535:
                     target_base_type = "SMALLINT UNSIGNED" if dialect == "mysql" else "SMALLINT"
                     target_bytes = 2
                     category = "Integer Downcast"
-                    reason_parts.append(f"Values range from {min_val:,} to {max_val:,} (fits in SMALLINT).")
-                elif -32768 <= min_val and max_val <= 32767:
-                    target_base_type = "SMALLINT"
-                    target_bytes = 2
-                    category = "Integer Downcast"
-                    reason_parts.append(f"Values range from {min_val:,} to {max_val:,} (fits in SMALLINT).")
-                elif dialect == "mysql" and "BIGINT" in col_type and 0 <= min_val and max_val <= 16777215:
-                    target_base_type = "MEDIUMINT UNSIGNED"
-                    target_bytes = 3
-                    category = "Integer Downcast"
-                    reason_parts.append(f"Values range from {min_val:,} to {max_val:,} (fits in MEDIUMINT).")
+                    risk_level = "MAYBE"
+                    risk_badge = "🟡 Check Growth"
+                    reason_parts.append(f"Values currently range from {min_val:,} to {max_val:,}. Verify future values will not exceed 65,535.")
                 elif "BIGINT" in col_type and 0 <= min_val and max_val <= 4294967295:
                     target_base_type = "INT UNSIGNED" if dialect == "mysql" else "INTEGER"
                     target_bytes = 4
                     category = "Integer Downcast"
-                    reason_parts.append(f"Values range from {min_val:,} to {max_val:,} (fits in INT).")
-                elif "BIGINT" in col_type and -2147483648 <= min_val and max_val <= 2147483647:
-                    target_base_type = "INT" if dialect != "postgresql" else "INTEGER"
-                    target_bytes = 4
-                    category = "Integer Downcast"
-                    reason_parts.append(f"Values range from {min_val:,} to {max_val:,} (fits in INT).")
+                    risk_level = "SAFE" if max_val < 50000000 else "MAYBE"
+                    risk_badge = "🟢 Safe & Confirmed" if max_val < 50000000 else "🟡 Check Growth"
+                    reason_parts.append(f"Values range from {min_val:,} to {max_val:,} (fits in 4-byte INT with 4.29B capacity).")
 
         # ===================================================================
         # 2. Evaluate String & Text Columns
@@ -186,8 +191,6 @@ def profile_table_columns(
                 declared_len = int(m.group(1))
             elif "TEXT" in col_type:
                 declared_len = 65535
-
-            is_phone_or_zip = any(k in col_name.lower() for k in ("phone", "tel", "mobile", "fax", "zip", "postal", "ssn", "pin", "barcode", "card"))
 
             if deep_verify and dialect == "mysql":
                 try:
@@ -221,29 +224,25 @@ def profile_table_columns(
                             leading_zeros = int(r[9] or 0)
                             verification_badge = "100% Full-Table Verified"
 
-                            # 2A: Pure numeric check (without leading zeros)
-                            if not is_pk and max_len <= 18 and not is_phone_or_zip and non_digit_cnt == 0 and leading_zeros == 0 and max_len > 0:
+                            # 2A: Pure numeric check (High risk if code/tracking/phone)
+                            if not is_id_column and max_len <= 18 and not is_phone_or_zip and non_digit_cnt == 0 and leading_zeros == 0 and max_len > 0:
                                 min_eff = min(0, min_n) if (empty_count > 0 or null_count > 0) else min_n
                                 max_eff = max(0, max_n)
-                                if 0 <= min_eff and max_eff <= 255:
+                                if 0 <= min_eff and max_eff <= 255 and is_flag_or_counter:
                                     target_base_type, target_bytes = "TINYINT UNSIGNED", 1
+                                    risk_level, risk_badge = "SAFE", "🟢 Safe & Confirmed"
                                 elif 0 <= min_eff and max_eff <= 65535:
                                     target_base_type, target_bytes = "SMALLINT UNSIGNED", 2
-                                elif 0 <= min_eff and max_eff <= 16777215:
-                                    target_base_type, target_bytes = "MEDIUMINT UNSIGNED", 3
+                                    risk_level, risk_badge = "MAYBE", "🟡 Check Growth"
                                 elif 0 <= min_eff and max_eff <= 4294967295:
                                     target_base_type, target_bytes = "INT UNSIGNED", 4
+                                    risk_level, risk_badge = "MAYBE", "🟡 Check Growth"
                                 else:
                                     target_base_type, target_bytes = "BIGINT UNSIGNED", 8
+                                    risk_level, risk_badge = "MAYBE", "🟡 Check Growth"
 
                                 category = "String to Integer Conversion"
                                 reason_parts.append(f"Contains 100% numeric digits (Min: {min_n:,}, Max: {max_n:,}). Converting to native {target_base_type}.")
-
-                            # 2B: Pure decimal check
-                            elif not is_pk and max_len <= 18 and not is_phone_or_zip and non_dec_cnt == 0 and non_digit_cnt > 0 and leading_zeros == 0:
-                                target_base_type, target_bytes = "DECIMAL(12, 2)", 6
-                                category = "String to Decimal Conversion"
-                                reason_parts.append("Contains 100% decimal numbers stored as string.")
 
                 except Exception:
                     pass
@@ -251,36 +250,27 @@ def profile_table_columns(
                 null_count = sample_size - len(series)
                 empty_count = int((str_s == "").sum())
 
-            # 2C: String-to-Enum conversion check
-            if target_base_type == col_type and not is_pk and max_len <= 20 and min_len >= 1 and not is_phone_or_zip and dialect == "mysql":
-                try:
-                    with engine.connect() as conn:
-                        d_sql = f"SELECT DISTINCT {col_quoted} FROM {tbl_quoted} WHERE {col_quoted} IS NOT NULL AND {col_quoted} != '' LIMIT 8"
-                        distinct_vals = {str(r[0]) for r in conn.execute(text(d_sql)).fetchall() if r[0] is not None}
-                        if 2 <= len(distinct_vals) <= 5 and all(len(v) <= 20 for v in distinct_vals):
-                            enum_opts = ", ".join(f"'{v}'" for v in sorted(distinct_vals))
-                            target_base_type = f"ENUM({enum_opts})"
-                            target_bytes = 1
-                            category = "String to ENUM Conversion"
-                            reason_parts.append(f"Only {len(distinct_vals)} distinct values ({', '.join(sorted(distinct_vals))}).")
-                except Exception:
-                    pass
-
-            # 2D: UUID format check
+            # 2B: UUID format check
             if target_base_type == col_type and max_len == 36 and min_len == 36 and str_s.str.contains(r"^[0-9a-fA-F-]{36}$").all():
                 target_base_type = "UUID" if dialect == "postgresql" else "CHAR(36)"
                 target_bytes = 36
                 category = "UUID Optimization"
+                risk_level = "SAFE"
+                risk_badge = "🟢 Safe & Confirmed"
                 reason_parts.append("Matches exact 36-char UUID format.")
 
-            # 2E: Oversized string shrink check
-            if target_base_type == col_type and declared_len >= 80 and max_len <= 35:
-                safe_len = max(max_len + 15, 30)
-                safe_len = ((safe_len + 9) // 10) * 10  # Round up to 10s
-                target_base_type = f"VARCHAR({safe_len})"
-                target_bytes = max(int((declared_len - safe_len) * 0.4), 2)
-                category = "Oversized String Shrink"
-                reason_parts.append(f"Max observed length is only {max_len} chars (allocated as {col_type}).")
+            # 2C: Oversized string shrink check with Generous Headroom
+            if target_base_type == col_type and declared_len >= 100 and max_len <= 35:
+                # Generous safety headroom: at least 2x max length or 64 bytes
+                safe_len = max(max_len * 2, 64)
+                safe_len = ((safe_len + 15) // 16) * 16  # standard 64, 80, 96, 128
+                if safe_len < declared_len:
+                    target_base_type = f"VARCHAR({safe_len})"
+                    target_bytes = max(int((declared_len - safe_len) * 0.3), 2)
+                    category = "Oversized String Shrink"
+                    risk_level = "MAYBE" if is_text_content else "SAFE"
+                    risk_badge = "🟡 Check Growth" if is_text_content else "🟢 Safe & Confirmed"
+                    reason_parts.append(f"Max observed length is {max_len} chars. Resized to VARCHAR({safe_len}) with {safe_len - max_len} chars safety headroom.")
 
         # ===================================================================
         # 3. Currency / Float Precision Optimization
@@ -290,13 +280,13 @@ def profile_table_columns(
                 target_base_type = "DECIMAL(12, 2)" if dialect != "sqlite" else "DECIMAL"
                 target_bytes = 6
                 category = "Financial Decimal Accuracy"
+                risk_level = "SAFE"
+                risk_badge = "🟢 Safe & Confirmed"
                 reason_parts.append(f"Represents financial currency data (replaces imprecise {col_type}).")
 
         # ===================================================================
         # 4. Compute Optimal Unified Nullability & Sanitization (Single Pass!)
         # ===================================================================
-        is_flag_or_counter = any(k in col_name.lower() for k in ("is_", "has_", "active", "enabled", "deleted", "flag", "count", "qty", "points", "attempts", "retry"))
-
         # Determine target nullability
         if null_count == 0 and empty_count == 0 and not is_pk and total_rows > 0:
             target_null_clause = "NOT NULL"
@@ -312,7 +302,6 @@ def profile_table_columns(
             else:
                 target_null_clause = "NULL"
                 target_default = "DEFAULT NULL"
-                # If currently NOT NULL, must unlock first before updating '' to NULL
                 if not is_nullable:
                     pre_sql = f"ALTER TABLE {tbl_quoted} MODIFY COLUMN {col_quoted} {col_type} NULL; UPDATE {tbl_quoted} SET {col_quoted} = NULL WHERE {col_quoted} = '';"
                 else:
@@ -335,7 +324,7 @@ def profile_table_columns(
         if is_type_changed or is_null_changed or is_sanitized:
             saved_per_row = max(current_bytes - target_bytes, 0)
             if not is_type_changed and is_null_changed and target_null_clause == "NOT NULL":
-                saved_per_row = 1  # 1 byte for null bitmap
+                saved_per_row = 1
             if not is_type_changed and is_sanitized and "CHAR" in col_type:
                 saved_per_row = 2
 
@@ -352,10 +341,22 @@ def profile_table_columns(
 
             full_sql = f"{pre_sql} {alter_stmt}".strip()
 
+            # Assign category and risk if it was purely sanitization
+            if not is_type_changed:
+                category = "Sanitize Empty Strings to NULL" if is_sanitized else "Tighten Nullability"
+                risk_level = "SAFE"
+                risk_badge = "🟢 Safe & Confirmed"
+
+            # Assign default check state: Only SAFE is checked by default!
+            default_checked = (risk_level == "SAFE")
+
             suggestions.append({
                 "table": table,
                 "column": col_name,
-                "category": category if is_type_changed else ("Sanitize Empty Strings to NULL" if is_sanitized else "Tighten Nullability"),
+                "category": category,
+                "risk_level": risk_level,
+                "risk_badge": risk_badge,
+                "default_checked": default_checked,
                 "current_type": current_full_type,
                 "suggested_type": suggested_full_type,
                 "verification": verification_badge,
@@ -379,107 +380,118 @@ def _estimate_type_bytes(col_type: str) -> int:
         return 3
     if "BIGINT" in t:
         return 8
-    if "INT" in t:
+    if "INT" in t or "INTEGER" in t:
         return 4
-    if "DOUBLE" in t or "FLOAT" in t or "REAL" in t:
-        return 8
-    if "DECIMAL" in t:
+    if "DECIMAL" in t or "NUMERIC" in t:
         return 6
-    if "DATETIME" in t or "TIMESTAMP" in t:
-        return 8
-    if "DATE" in t:
+    if "FLOAT" in t:
         return 4
-    if "VARCHAR" in t:
+    if "DOUBLE" in t or "REAL" in t:
+        return 8
+    if "UUID" in t:
+        return 16
+    if "VARCHAR" in t or "CHAR" in t:
         m = re.search(r"\((\d+)\)", t)
-        return int(m.group(1)) if m else 50
-    if "TEXT" in t:
-        return 64
-    return 16
+        if m:
+            return min(int(m.group(1)), 255)
+        return 255
+    if "TEXT" in t or "BLOB" in t:
+        return 255
+    return 8
 
 
-def generate_type_migration_script(engine: Engine, table: str, suggestions: list[dict], database: str = "") -> str:
-    dialect = engine.dialect.name
-    lines = [
-        f"-- ========================================================",
-        f"-- SQL Helper: Unified Data Type Optimization Script",
-        f"-- Table: {table} | Dialect: {dialect.upper()}",
-        f"-- ========================================================\n",
-    ]
+def _alter_col_sql(
+    dialect: str,
+    database: str,
+    table: str,
+    column: str,
+    target_type: str,
+    nullable: bool = True,
+    default: str = "",
+    auto_increment: bool = False,
+) -> str:
+    """Generates the dialect-specific ALTER TABLE column modification SQL."""
+    tbl_quoted = f"`{database}`.`{table}`" if dialect == "mysql" and database else (f"`{table}`" if dialect == "mysql" else f'"{table}"')
+    col_quoted = f"`{column}`" if dialect == "mysql" else f'"{column}"'
+    null_clause = "NULL" if nullable else "NOT NULL"
+    auto_inc_clause = " AUTO_INCREMENT" if auto_increment and dialect == "mysql" else ""
+    d_clause = f" {default}" if default else ""
 
-    for s in suggestions:
-        lines.append(f"-- [{s['category']}] {s['column']}: {s['current_type']} -> {s['suggested_type']}")
-        lines.append(f"-- Verification: {s.get('verification', 'Verified')}")
-        lines.append(f"-- Reason: {s['reason']}")
-        if s.get("est_total_saved_bytes", 0) > 0:
-            lines.append(f"-- Estimated Space Saved: {s['formatted_savings']}")
-        lines.append(f"{s['sql']}\n")
+    if dialect == "mysql":
+        return f"ALTER TABLE {tbl_quoted} MODIFY COLUMN {col_quoted} {target_type} {null_clause}{auto_inc_clause}{d_clause};"
+    elif dialect == "postgresql":
+        not_null_part = f' ALTER TABLE {tbl_quoted} ALTER COLUMN {col_quoted} SET NOT NULL;' if not nullable else ""
+        return f'ALTER TABLE {tbl_quoted} ALTER COLUMN {col_quoted} TYPE {target_type};{not_null_part}'
+    else:  # sqlite
+        return f'-- SQLite: Rebuild required for "{column}" to {target_type}'
 
-    return "\n".join(lines)
+
+
+def scan_all_tables_for_types(
+    engine: Engine,
+    database: str,
+    sample_limit: int = 1500,
+    deep_verify: bool = True,
+) -> dict[str, list[dict]]:
+    """Scans all tables in the target database for single-pass unified type recommendations."""
+    tables = sr.list_tables(engine, database)
+    all_suggestions: dict[str, list[dict]] = {}
+
+    for tbl in tables:
+        try:
+            suggs = profile_table_columns(engine, database, tbl, sample_limit=sample_limit, deep_verify=deep_verify)
+            if suggs:
+                all_suggestions[tbl] = suggs
+        except Exception:
+            continue
+
+    return all_suggestions
 
 
 def generate_database_type_migration_script(
-    engine: Engine,
-    all_suggestions: dict[str, list[dict]],
+    database_suggestions: dict[str, list[dict]],
+    dialect: str = "mysql",
     database: str = "",
-    ai_audit_map: dict[str, dict[str, dict]] | None = None,
+    ai_audit_map: dict[str, dict] | None = None,
     ai_approved_only: bool = False,
 ) -> str:
-    dialect = engine.dialect.name
-    filtered_suggestions: dict[str, list[dict]] = {}
-
-    for tbl, suggs in all_suggestions.items():
-        tbl_key = tbl.lower()
-        tbl_audit = (ai_audit_map or {}).get(tbl_key, {})
-        valid_suggs = []
-        for s in suggs:
-            col_key = s["column"].lower()
-            col_audit = tbl_audit.get(col_key, {})
-            status = col_audit.get("status", "APPROVED")
-            if ai_approved_only and status == "CAUTION":
-                continue
-            valid_suggs.append(s)
-        if valid_suggs:
-            filtered_suggestions[tbl] = valid_suggs
-
-    mode_label = " (🛡️ AI-Approved Safe Migrations Only)" if ai_approved_only else " (📋 Complete Schema Profile)"
+    """Generates a complete batch DDL SQL migration script for all recommended data type optimizations."""
+    total_modifications = sum(len(s) for s in database_suggestions.values())
+    if total_modifications == 0:
+        return "-- No data type optimizations found."
 
     lines = [
         f"-- ========================================================",
-        f"-- SQL Helper: Database-Wide Data Type Optimization Script{mode_label}",
-        f"-- Database: {database or 'Active Database'} | Dialect: {dialect.upper()}",
-        f"-- Total Tables Included: {len(filtered_suggestions)}",
-        f"-- ========================================================\n",
+        f"-- SQL Helper: Database-Wide Data Type Migration Script",
+        f"-- Dialect: {dialect.upper()} | Target Database: {database or 'Active Schema'}",
+        f"-- Generated Single-Pass Optimizations & Sanitizations",
+        f"-- ========================================================",
+        f"",
+        f"SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO';" if dialect == "mysql" else "",
+        f"",
     ]
 
-    for tbl, suggs in filtered_suggestions.items():
-        tbl_key = tbl.lower()
-        tbl_audit = (ai_audit_map or {}).get(tbl_key, {})
-        lines.append(f"-- ── Table: `{tbl}` ({len(suggs)} Optimizations) ──────────────────────")
+    for tbl, suggs in database_suggestions.items():
+        tbl_lines = []
         for s in suggs:
-            col_key = s["column"].lower()
-            col_audit = tbl_audit.get(col_key, {})
-            ai_status = col_audit.get("status", "")
-            ai_note = f" [{ai_status}]" if ai_status else ""
-            if col_audit.get("analysis"):
-                lines.append(f"-- AI Semantic Note: {col_audit['analysis']}")
-            lines.append(f"-- [{s['category']}]{ai_note} {s['column']}: {s['current_type']} -> {s['suggested_type']}")
-            lines.append(f"{s['sql']}")
-        lines.append("")
+            col_key = f"{tbl}.{s['column']}"
+            ai_info = ai_audit_map.get(col_key, {}) if ai_audit_map else {}
+            ai_status = ai_info.get("status", "APPROVED")
 
-    return "\n".join(lines)
+            if ai_approved_only and ai_status == "CAUTION":
+                continue
 
+            tbl_lines.append(f"-- [{s['risk_badge']}] Column `{s['column']}`: {s['current_type']} -> {s['suggested_type']}")
+            tbl_lines.append(f"-- Reason: {s['reason']}")
+            if ai_info and ai_info.get("analysis"):
+                tbl_lines.append(f"-- AI Audit ({ai_status}): {ai_info['analysis']}")
+            tbl_lines.append(f"{s['sql']}\n")
 
-def _alter_col_sql(dialect: str, database: str, table: str, column: str, new_type: str, nullable: bool = True, is_auto_inc: bool = False) -> str:
-    null_clause = " NULL" if nullable else " NOT NULL"
-    auto_inc_clause = " AUTO_INCREMENT" if is_auto_inc and dialect == "mysql" else ""
-    if dialect == "mysql":
-        tbl = f"`{database}`.`{table}`" if database else f"`{table}`"
-        return f"ALTER TABLE {tbl} MODIFY COLUMN `{column}` {new_type}{null_clause}{auto_inc_clause};"
-    elif dialect == "postgresql":
-        tbl = f'"{table}"'
-        null_sql = f'ALTER TABLE {tbl} ALTER COLUMN "{column}" SET NOT NULL;' if not nullable else ""
-        return f'ALTER TABLE {tbl} ALTER COLUMN "{column}" TYPE {new_type}; {null_sql}'.strip()
-    else:  # sqlite
-        return f'-- SQLite: Table rewrite required to alter column "{column}" to {new_type}{null_clause}'
+        if tbl_lines:
+            lines.append(f"-- --------------------------------------------------------")
+            lines.append(f"-- Table: `{tbl}`")
+            lines.append(f"-- --------------------------------------------------------")
+            lines.extend(tbl_lines)
 
-
+    lines.append(f"SET SQL_MODE=@OLD_SQL_MODE;" if dialect == "mysql" else "")
+    return "\n".join([l for l in lines if l is not None])

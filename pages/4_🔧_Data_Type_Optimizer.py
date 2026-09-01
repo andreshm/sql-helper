@@ -5,34 +5,33 @@ from app.ui.theme import apply_theme, render_metric_card
 from app.ui.components.connection_form import render_connection_sidebar
 from app.db import schema_reader as sr
 from app.db.data_reader import execute_query
+from app.db.size_analyzer import format_bytes
 from app.db.type_optimizer import (
     profile_table_columns,
-    scan_database_column_types,
-    generate_type_migration_script,
+    scan_all_tables_for_types,
     generate_database_type_migration_script,
 )
-from app.ai.provider import ask
 from app.ai.type_advisor import (
     build_type_audit_prompt,
     parse_ai_type_audit,
     build_database_wide_type_audit_prompt,
     parse_database_wide_ai_type_audit,
 )
-from app.ai.validator import verify_sql_against_schema
-from app.db.size_analyzer import format_bytes
-from app.db.connections import persist_active_database
+from app.ai.provider import ask
 
 st.set_page_config(page_title="Data Type Optimizer — SQL Helper", page_icon="🔧", layout="wide")
 apply_theme()
 render_connection_sidebar()
 
-st.title("🔧 Data Type Optimizer & Storage Reducer")
-st.caption("Single-Pass Unified Optimizer with AI Semantic Double-Checking: Computes optimal types, shrinks oversized strings, sanitizes empty strings to NULL, and audits domain safety with Local AI.")
+st.title("🔧 Data Type Optimizer & Storage Footprint Reducer")
+st.caption("Conservative, single-pass column profiling with strict 3-tier safety risk classification, ID sequence protection, and AI domain audits.")
 
 engine = st.session_state.get("engine")
 if engine is None:
-    st.info("Connect to a database using the sidebar to optimize data types.")
+    st.info("Connect to a database using the sidebar to analyze column data types.")
     st.stop()
+
+from app.db.connections import persist_active_database
 
 dialect = engine.dialect.name
 is_test_db = st.session_state.get("is_test_db", False)
@@ -59,7 +58,7 @@ if dialect != "sqlite" and len(databases) > 1:
             databases,
             index=databases.index(current_db) if current_db in databases else 0,
             label_visibility="collapsed",
-            key="type_db_switch",
+            key="type_opt_db_switch",
         )
         if sel_db != current_db:
             st.session_state.selected_database = sel_db
@@ -74,54 +73,46 @@ except Exception as e:
     st.error(f"Could not list tables: {e}")
     st.stop()
 
-# Initialize executed fixes tracking set
 if "executed_fixes" not in st.session_state:
     st.session_state.executed_fixes = set()
 
-# Cache keys per database
-db_cache_key = f"db_wide_type_results_{selected_db}"
-db_sql_cache_key = f"db_wide_migration_sql_{selected_db}"
-db_ai_cache_key = f"db_wide_ai_audit_{selected_db}"
-
-tab_global, tab_single, tab_script = st.tabs([
-    "🌐 Database-Wide All-Tables Optimizer",
+tab_all, tab_single, tab_script = st.tabs([
+    "🌐 Database-Wide (All Tables Optimizer)",
     "📋 Single Table Deep Inspector",
-    "📜 Full Database Migration Script",
+    "📜 Full Database Migration Script"
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 1: Database-Wide All-Tables Optimizer
+# Tab 1: Database-Wide (All Tables Optimizer)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_global:
-    st.markdown("### 🌐 Database-Wide Column Type Optimization")
-    st.caption("Scans every table in your database at once and presents all verified optimizations in a single master checklist.")
+with tab_all:
+    st.markdown("### 🌐 Database-Wide All Tables Optimizer")
+    st.caption("Scan all tables across the entire schema in a single pass to discover safe storage reductions and sanitize empty strings.")
+
+    db_cache_key = f"db_wide_type_suggestions_{selected_db}"
+    db_sql_cache_key = f"db_wide_type_script_{selected_db}"
+    db_ai_cache_key = f"db_wide_ai_audit_{selected_db}"
 
     scan_c1, scan_c2 = st.columns([3, 1])
     with scan_c1:
-        st.info(f"Database **`{selected_db}`** contains **{len(tables)} tables**. Run the full scan below to discover all storage and memory reductions across the entire schema.")
+        st.info(f"Database **`{selected_db}`** contains **{len(tables)} tables**. All suggestions are classified by growth risk (🟢 Safe, 🟡 Check Growth, 🔴 High Risk).")
     with scan_c2:
         st.write("")
         run_full_scan = st.button("🚀 Scan Entire Database", type="primary", use_container_width=True, key="btn_run_db_scan")
 
-    # Only run the heavy scan when explicitly triggered
     if run_full_scan:
         progress_bar = st.progress(0, text="Initializing database scan...")
-        
-        def _scan_progress(curr, total, tbl_name):
-            progress_bar.progress(curr / total, text=f"Analyzing table ({curr}/{total}): `{tbl_name}`…")
-
-        results = scan_database_column_types(engine, selected_db, deep_verify=True, progress_callback=_scan_progress)
+        results = scan_all_tables_for_types(engine, selected_db, sample_limit=1500, deep_verify=True)
         progress_bar.empty()
         st.session_state[db_cache_key] = results
-        st.session_state[db_sql_cache_key] = generate_database_type_migration_script(engine, results, selected_db)
+        st.session_state[db_sql_cache_key] = generate_database_type_migration_script(results, dialect=dialect, database=selected_db)
         
-        # Reset selection keys to True for new scan
+        # Initialize checkboxes: ONLY SAFE items checked by default!
         for t_name, s_list in results.items():
-            for idx in range(len(s_list)):
-                st.session_state[f"db_chk_{t_name}_{idx}"] = True
+            for idx, s in enumerate(s_list):
+                st.session_state[f"db_chk_{t_name}_{idx}"] = s.get("default_checked", False)
         st.rerun()
 
-    # Check if results exist in cache
     all_db_suggs = st.session_state.get(db_cache_key)
 
     if all_db_suggs is None:
@@ -141,21 +132,27 @@ with tab_global:
 
         st.divider()
 
-        # Global Toolbar & AI Auditor
-        gt_col1, gt_col2, gt_col3 = st.columns([1, 1, 2])
-        if gt_col1.button("☑️ Select All (Global)", key="db_sel_all", use_container_width=True):
+        # Global Toolbar, Risk Filter & AI Auditor
+        gt_col1, gt_col2, gt_col3, gt_col4 = st.columns([1, 1, 1, 2])
+        if gt_col1.button("🟢 Select Safe Only", key="db_sel_safe", use_container_width=True):
+            for t_name, s_list in all_db_suggs.items():
+                for idx, s in enumerate(s_list):
+                    st.session_state[f"db_chk_{t_name}_{idx}"] = (s.get("risk_level") == "SAFE")
+            st.rerun()
+
+        if gt_col2.button("☑️ Select All", key="db_sel_all", use_container_width=True):
             for t_name, s_list in all_db_suggs.items():
                 for idx in range(len(s_list)):
                     st.session_state[f"db_chk_{t_name}_{idx}"] = True
             st.rerun()
 
-        if gt_col2.button("⬜ Deselect All (Global)", key="db_desel_all", use_container_width=True):
+        if gt_col3.button("⬜ Deselect All", key="db_desel_all", use_container_width=True):
             for t_name, s_list in all_db_suggs.items():
                 for idx in range(len(s_list)):
                     st.session_state[f"db_chk_{t_name}_{idx}"] = False
             st.rerun()
 
-        if gt_col3.button("🤖 Run Database-Wide AI Semantic Audit", key="btn_db_ai_audit", use_container_width=True):
+        if gt_col4.button("🤖 Run Database-Wide AI Semantic Audit", key="btn_db_ai_audit", use_container_width=True):
             with st.spinner("Local AI is auditing domain safety across all candidate migrations…"):
                 prompt = build_database_wide_type_audit_prompt(dialect, all_db_suggs)
                 ai_raw = ask(cfg, prompt)
@@ -171,17 +168,15 @@ with tab_global:
                         c_audit = t_audit.get(c_key, {})
                         if c_audit.get("status") == "CAUTION":
                             st.session_state[f"db_chk_{t_name}_{idx}"] = False
-                # Re-generate script with AI annotations
-                st.session_state[db_sql_cache_key] = generate_database_type_migration_script(engine, all_db_suggs, selected_db, ai_audit_map=parsed)
+                st.session_state[db_sql_cache_key] = generate_database_type_migration_script(all_db_suggs, dialect=dialect, database=selected_db, ai_audit_map=parsed)
             st.rerun()
 
-        # Display AI Raw Report Expander if present
         if f"{db_ai_cache_key}_raw" in st.session_state:
             with st.expander("📖 Database-Wide AI Semantic Audit Report", expanded=False):
                 st.markdown(st.session_state[f"{db_ai_cache_key}_raw"])
 
         db_ai_audit_map = st.session_state.get(db_ai_cache_key, {})
-        selected_global_sqls = []
+        selected_global_items = []
 
         # Display grouped by table
         for t_name, s_list in all_db_suggs.items():
@@ -204,14 +199,23 @@ with tab_global:
                             else:
                                 chk_key = f"db_chk_{t_name}_{idx}"
                                 if chk_key not in st.session_state:
-                                    st.session_state[chk_key] = False if ai_status == "CAUTION" else True
+                                    st.session_state[chk_key] = s.get("default_checked", False) if ai_status != "CAUTION" else False
                                 is_checked = st.checkbox("", key=chk_key)
                                 if is_checked:
-                                    selected_global_sqls.append(sql_stmt)
+                                    selected_global_items.append((sql_stmt, s, t_name))
 
                         with r2:
                             b_html = '<span class="badge-pill badge-success">✅ APPLIED</span>' if is_applied else f'<span class="badge-pill badge-info">{s.get("verification", "Verified")}</span>'
                             
+                            # Add Risk Badge
+                            r_level = s.get("risk_level", "SAFE")
+                            if r_level == "SAFE":
+                                b_html += ' <span class="badge-pill badge-success">🟢 Safe & Confirmed</span>'
+                            elif r_level == "MAYBE":
+                                b_html += ' <span class="badge-pill badge-warning">🟡 Check Growth</span>'
+                            else:
+                                b_html += ' <span class="badge-pill badge-danger">🔴 High Risk / Sequence</span>'
+
                             # Add AI Badge
                             if ai_status == "APPROVED":
                                 b_html += ' <span class="badge-pill badge-success">🛡️ AI Approved</span>'
@@ -221,7 +225,7 @@ with tab_global:
                                 b_html += ' <span class="badge-pill badge-info">💡 AI Refinement</span>'
 
                             st.markdown(f"**🔧 `{s['column']}`**: `{s['current_type']}` → **`{s['suggested_type']}`** (Saves {s['formatted_savings']}) {b_html}", unsafe_allow_html=True)
-                            st.caption(s["reason"])
+                            st.caption(f"**Reason**: {s['reason']}")
                             
                             code_c1, code_c2 = st.columns([12, 3])
                             with code_c1:
@@ -231,64 +235,117 @@ with tab_global:
                                 if is_applied:
                                     st.button("✅ Applied", key=f"btn_run_single_db_{t_name}_{idx}", disabled=True, use_container_width=True)
                                 else:
-                                    run_lbl = "▶️ Run Fix" if is_test_db else "🔓 Run Fix"
-                                    if st.button(run_lbl, key=f"btn_run_single_db_{t_name}_{idx}", use_container_width=True):
-                                        if not is_test_db:
-                                            st.session_state.is_test_db = True
-                                        with st.spinner(f"Applying fix on `{t_name}.{s['column']}`…"):
-                                            _, err, _ = execute_query(engine, sql_stmt, database=selected_db)
-                                            if err:
-                                                st.error(f"Error: {err}")
-                                            else:
-                                                st.session_state.executed_fixes.add(sql_stmt)
-                                                st.success(f"✅ Updated `{t_name}.{s['column']}`!")
-                                                st.rerun()
+                                    if r_level != "SAFE":
+                                        with st.popover("⚠️ Verify & Run", use_container_width=True):
+                                            st.warning(f"**Growth Check Required for `{t_name}.{s['column']}`**:\nAltering column type may cause errors if future application inserts exceed `{s['suggested_type']}`.")
+                                            conf_single = st.checkbox("I have verified future volume.", key=f"chk_conf_db_{t_name}_{idx}")
+                                            if st.button("Confirm & Apply Fix", type="primary", disabled=not conf_single, key=f"btn_conf_run_db_{t_name}_{idx}"):
+                                                if not is_test_db:
+                                                    st.session_state.is_test_db = True
+                                                with st.spinner(f"Applying fix on `{t_name}.{s['column']}`…"):
+                                                    _, err, _ = execute_query(engine, sql_stmt, database=selected_db)
+                                                    if err:
+                                                        st.error(f"Error: {err}")
+                                                    else:
+                                                        st.session_state.executed_fixes.add(sql_stmt)
+                                                        st.success(f"✅ Updated `{t_name}.{s['column']}`!")
+                                                        st.rerun()
+                                    else:
+                                        run_lbl = "▶️ Run Fix" if is_test_db else "🔓 Run Fix"
+                                        if st.button(run_lbl, key=f"btn_run_single_db_{t_name}_{idx}", use_container_width=True):
+                                            if not is_test_db:
+                                                st.session_state.is_test_db = True
+                                            with st.spinner(f"Applying fix on `{t_name}.{s['column']}`…"):
+                                                _, err, _ = execute_query(engine, sql_stmt, database=selected_db)
+                                                if err:
+                                                    st.error(f"Error: {err}")
+                                                else:
+                                                    st.session_state.executed_fixes.add(sql_stmt)
+                                                    st.success(f"✅ Updated `{t_name}.{s['column']}`!")
+                                                    st.rerun()
 
                             if ai_analysis:
                                 st.info(f"🤖 **AI Domain Analysis**: {ai_analysis}")
                         st.write("")
 
-        # Global Bottom Execution Button Toolbar (Always visible!)
+        # Global Bottom Execution Button Toolbar with Safety Modal
         st.write("")
         st.divider()
+        
+        non_safe_selected = [item for item in selected_global_items if item[1].get("risk_level") != "SAFE"]
+        selected_sqls_only = [item[0] for item in selected_global_items]
+
         b_c1, b_c2 = st.columns([2, 3])
         with b_c1:
-            if is_test_db:
-                btn_lbl = f"⚡ Apply Selected Fixes ({len(selected_global_sqls)})" if selected_global_sqls else "⚡ Apply Selected Fixes"
-                do_apply = st.button(btn_lbl, type="primary", use_container_width=True, key="apply_db_wide_types", disabled=not selected_global_sqls)
+            if non_safe_selected:
+                with st.popover(f"⚠️ Confirm & Apply Fixes ({len(selected_global_sqls_only := selected_sqls_only)})", use_container_width=True):
+                    st.warning(f"**Safety Confirmation Required**:\nYou have selected **{len(non_safe_selected)} migrations** classified as `🟡 Check Growth` or `🔴 High Risk`.")
+                    st.markdown("Altering column types on growing tables can cause insert errors if future data exceeds these bounds.")
+                    st.markdown("**Potentially Growing Columns Selected:**")
+                    for stmt, s_obj, t_nm in non_safe_selected[:6]:
+                        st.markdown(f"* `{t_nm}.{s_obj['column']}`: `{s_obj['current_type']}` → `{s_obj['suggested_type']}`")
+                    if len(non_safe_selected) > 6:
+                        st.caption(f"... +{len(non_safe_selected) - 6} more")
+                    
+                    user_conf = st.checkbox("I understand the growth risks and have backed up my database.", key="batch_db_conf_chk")
+                    if st.button("🚀 Proceed & Apply All Migrations", type="primary", disabled=not user_conf, key="batch_db_proceed_btn"):
+                        if not is_test_db:
+                            st.session_state.is_test_db = True
+                        errors = []
+                        p_bar = st.progress(0, text="Applying database-wide type optimizations...")
+                        for i, stmt in enumerate(selected_sqls_only):
+                            p_bar.progress((i + 1) / len(selected_sqls_only), text=f"Executing fix {i+1}/{len(selected_sqls_only)}…")
+                            _, err, _ = execute_query(engine, stmt, database=selected_db)
+                            if err:
+                                errors.append(f"{stmt} -> {err}")
+                            else:
+                                st.session_state.executed_fixes.add(stmt)
+                        p_bar.empty()
+                        if errors:
+                            for e in errors:
+                                st.error(e)
+                        else:
+                            st.success(f"🎉 Successfully applied {len(selected_sqls_only)} data type optimizations across the database!")
+                            results = scan_all_tables_for_types(engine, selected_db, sample_limit=1500, deep_verify=True)
+                            st.session_state[db_cache_key] = results
+                            st.session_state[db_sql_cache_key] = generate_database_type_migration_script(results, dialect=dialect, database=selected_db, ai_audit_map=db_ai_audit_map)
+                            st.rerun()
             else:
-                btn_lbl = f"🔓 Enable Execution & Apply Fixes ({len(selected_global_sqls)})" if selected_global_sqls else "🔓 Enable Execution & Apply Fixes"
-                do_apply = st.button(btn_lbl, type="primary", use_container_width=True, key="unlock_and_apply_db_wide", disabled=not selected_global_sqls)
-                if do_apply:
-                    st.session_state.is_test_db = True
-
-            if do_apply and selected_global_sqls:
-                errors = []
-                p_bar = st.progress(0, text="Applying database-wide type optimizations...")
-                for i, stmt in enumerate(selected_global_sqls):
-                    p_bar.progress((i + 1) / len(selected_global_sqls), text=f"Executing fix {i+1}/{len(selected_global_sqls)}…")
-                    _, err, _ = execute_query(engine, stmt, database=selected_db)
-                    if err:
-                        errors.append(f"{stmt} -> {err}")
-                    else:
-                        st.session_state.executed_fixes.add(stmt)
-                p_bar.empty()
-                if errors:
-                    for e in errors:
-                        st.error(e)
+                if is_test_db:
+                    btn_lbl = f"⚡ Apply Selected Fixes ({len(selected_sqls_only)})" if selected_sqls_only else "⚡ Apply Selected Fixes"
+                    do_apply = st.button(btn_lbl, type="primary", use_container_width=True, key="apply_db_wide_types", disabled=not selected_sqls_only)
                 else:
-                    st.success(f"🎉 Successfully applied {len(selected_global_sqls)} data type optimizations across the database!")
-                    # Refresh scan
-                    results = scan_database_column_types(engine, selected_db, deep_verify=True)
-                    st.session_state[db_cache_key] = results
-                    st.session_state[db_sql_cache_key] = generate_database_type_migration_script(engine, results, selected_db, ai_audit_map=db_ai_audit_map)
-                    st.rerun()
+                    btn_lbl = f"🔓 Enable Execution & Apply Fixes ({len(selected_sqls_only)})" if selected_sqls_only else "🔓 Enable Execution & Apply Fixes"
+                    do_apply = st.button(btn_lbl, type="primary", use_container_width=True, key="unlock_and_apply_db_wide", disabled=not selected_sqls_only)
+                    if do_apply:
+                        st.session_state.is_test_db = True
+
+                if do_apply and selected_sqls_only:
+                    errors = []
+                    p_bar = st.progress(0, text="Applying database-wide type optimizations...")
+                    for i, stmt in enumerate(selected_sqls_only):
+                        p_bar.progress((i + 1) / len(selected_sqls_only), text=f"Executing fix {i+1}/{len(selected_sqls_only)}…")
+                        _, err, _ = execute_query(engine, stmt, database=selected_db)
+                        if err:
+                            errors.append(f"{stmt} -> {err}")
+                        else:
+                            st.session_state.executed_fixes.add(stmt)
+                    p_bar.empty()
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                    else:
+                        st.success(f"🎉 Successfully applied {len(selected_sqls_only)} data type optimizations across the database!")
+                        results = scan_all_tables_for_types(engine, selected_db, sample_limit=1500, deep_verify=True)
+                        st.session_state[db_cache_key] = results
+                        st.session_state[db_sql_cache_key] = generate_database_type_migration_script(results, dialect=dialect, database=selected_db, ai_audit_map=db_ai_audit_map)
+                        st.rerun()
 
         with b_c2:
             if not is_test_db:
-                st.caption("🔒 **Execution Mode is OFF** (Read-Only Guardrail). Clicking the button above will enable execution mode and apply your selected migrations directly.")
+                st.caption("🔒 **Execution Mode is OFF** (Read-Only Guardrail). Clicking above will enable execution mode and apply your selected migrations directly.")
             else:
-                st.caption(f"⚡ **Execution Mode is ACTIVE**. Click above to apply all {len(selected_global_sqls)} selected DDL migrations.")
+                st.caption(f"⚡ **Execution Mode is ACTIVE**. Click above to apply all {len(selected_sqls_only)} selected DDL migrations.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 2: Single Table Deep Inspector
@@ -355,7 +412,6 @@ with tab_single:
                         st.session_state[f"ai_audit_parsed_{target_table}"] = parse_ai_type_audit(ai_raw)
                     st.rerun()
 
-            # Display AI raw audit in expander if available
             if f"ai_audit_raw_{target_table}" in st.session_state:
                 with st.expander("📖 Full AI Semantic Audit Report", expanded=False):
                     st.markdown(st.session_state[f"ai_audit_raw_{target_table}"])
@@ -364,17 +420,22 @@ with tab_single:
 
             # Selection Toolbar for Single Table
             s_tb1, s_tb2, s_tb3 = st.columns([1, 1, 3])
-            if s_tb1.button("☑️ Select All", key=f"single_sel_all_{target_table}", use_container_width=True):
+            if s_tb1.button("🟢 Select Safe Only", key=f"single_sel_safe_{target_table}", use_container_width=True):
+                for idx, s in enumerate(single_suggs):
+                    st.session_state[f"single_chk_{target_table}_{idx}"] = (s.get("risk_level") == "SAFE")
+                st.rerun()
+
+            if s_tb2.button("☑️ Select All", key=f"single_sel_all_{target_table}", use_container_width=True):
                 for idx in range(len(single_suggs)):
                     st.session_state[f"single_chk_{target_table}_{idx}"] = True
                 st.rerun()
 
-            if s_tb2.button("⬜ Deselect All", key=f"single_desel_all_{target_table}", use_container_width=True):
+            if s_tb3.button("⬜ Deselect All", key=f"single_desel_all_{target_table}", use_container_width=True):
                 for idx in range(len(single_suggs)):
                     st.session_state[f"single_chk_{target_table}_{idx}"] = False
                 st.rerun()
 
-            selected_single_sqls = []
+            selected_single_items = []
 
             for i, s in enumerate(single_suggs):
                 sql_stmt = s["sql"]
@@ -392,14 +453,23 @@ with tab_single:
                         else:
                             chk_single_key = f"single_chk_{target_table}_{i}"
                             if chk_single_key not in st.session_state:
-                                st.session_state[chk_single_key] = False if ai_status == "CAUTION" else True
+                                st.session_state[chk_single_key] = s.get("default_checked", False) if ai_status != "CAUTION" else False
                             is_checked = st.checkbox("", key=chk_single_key)
                             if is_checked:
-                                selected_single_sqls.append(sql_stmt)
+                                selected_single_items.append((sql_stmt, s))
 
                     with r_c2:
                         badge_html = '<span class="badge-pill badge-success">✅ APPLIED</span>' if is_applied else f'<span class="badge-pill badge-info">{s.get("verification", "Verified")}</span>'
                         
+                        # Add Risk Badge
+                        r_level = s.get("risk_level", "SAFE")
+                        if r_level == "SAFE":
+                            badge_html += ' <span class="badge-pill badge-success">🟢 Safe & Confirmed</span>'
+                        elif r_level == "MAYBE":
+                            badge_html += ' <span class="badge-pill badge-warning">🟡 Check Growth</span>'
+                        else:
+                            badge_html += ' <span class="badge-pill badge-danger">🔴 High Risk / Sequence</span>'
+
                         # Add AI Badge
                         if ai_status == "APPROVED":
                             badge_html += ' <span class="badge-pill badge-success">🛡️ AI Approved</span>'
@@ -409,7 +479,7 @@ with tab_single:
                             badge_html += ' <span class="badge-pill badge-info">💡 AI Refinement</span>'
 
                         st.markdown(f"**🔧 `{s['column']}`**: `{s['current_type']}` → **`{s['suggested_type']}`** (Saves {s['formatted_savings']}) {badge_html}", unsafe_allow_html=True)
-                        st.caption(s["reason"])
+                        st.caption(f"**Reason**: {s['reason']}")
                         
                         code_c1, code_c2 = st.columns([12, 3])
                         with code_c1:
@@ -419,119 +489,147 @@ with tab_single:
                             if is_applied:
                                 st.button("✅ Applied", key=f"btn_run_single_tbl_{target_table}_{i}", disabled=True, use_container_width=True)
                             else:
-                                run_lbl = "▶️ Run Fix" if is_test_db else "🔓 Run Fix"
-                                if st.button(run_lbl, key=f"btn_run_single_tbl_{target_table}_{i}", use_container_width=True):
-                                    if not is_test_db:
-                                        st.session_state.is_test_db = True
-                                    with st.spinner(f"Applying fix on `{target_table}.{s['column']}`…"):
-                                        _, err, _ = execute_query(engine, sql_stmt, database=selected_db)
-                                        if err:
-                                            st.error(f"Error: {err}")
-                                        else:
-                                            st.session_state.executed_fixes.add(sql_stmt)
-                                            st.success(f"✅ Updated `{target_table}.{s['column']}`!")
-                                            st.rerun()
+                                if r_level != "SAFE":
+                                    with st.popover("⚠️ Verify & Run", use_container_width=True):
+                                        st.warning(f"**Growth Check Required for `{target_table}.{s['column']}`**:\nAltering column type may cause errors if future application inserts exceed `{s['suggested_type']}`.")
+                                        conf_single = st.checkbox("I have verified future volume.", key=f"chk_conf_single_{target_table}_{i}")
+                                        if st.button("Confirm & Apply Fix", type="primary", disabled=not conf_single, key=f"btn_conf_run_single_{target_table}_{i}"):
+                                            if not is_test_db:
+                                                st.session_state.is_test_db = True
+                                            with st.spinner(f"Applying fix on `{target_table}.{s['column']}`…"):
+                                                _, err, _ = execute_query(engine, sql_stmt, database=selected_db)
+                                                if err:
+                                                    st.error(f"Error: {err}")
+                                                else:
+                                                    st.session_state.executed_fixes.add(sql_stmt)
+                                                    st.success(f"✅ Updated `{target_table}.{s['column']}`!")
+                                                    st.rerun()
+                                else:
+                                    run_lbl = "▶️ Run Fix" if is_test_db else "🔓 Run Fix"
+                                    if st.button(run_lbl, key=f"btn_run_single_tbl_{target_table}_{i}", use_container_width=True):
+                                        if not is_test_db:
+                                            st.session_state.is_test_db = True
+                                        with st.spinner(f"Applying fix on `{target_table}.{s['column']}`…"):
+                                            _, err, _ = execute_query(engine, sql_stmt, database=selected_db)
+                                            if err:
+                                                st.error(f"Error: {err}")
+                                            else:
+                                                st.session_state.executed_fixes.add(sql_stmt)
+                                                st.success(f"✅ Updated `{target_table}.{s['column']}`!")
+                                                st.rerun()
 
                         if ai_analysis:
                             st.info(f"🤖 **AI Domain Analysis**: {ai_analysis}")
 
                     st.write("")
 
-            # Single Table Bottom Execution Button Toolbar (Always visible!)
+            # Single Table Bottom Execution Button Toolbar with Safety Modal
             st.write("")
             st.divider()
+
+            non_safe_single = [item for item in selected_single_items if item[1].get("risk_level") != "SAFE"]
+            selected_single_sqls = [item[0] for item in selected_single_items]
+
             sb_c1, sb_c2 = st.columns([2, 3])
             with sb_c1:
-                if is_test_db:
-                    btn_single_lbl = f"🔧 Apply Selected Type Fixes ({len(selected_single_sqls)})" if selected_single_sqls else "🔧 Apply Selected Type Fixes"
-                    do_single_apply = st.button(btn_single_lbl, type="primary", use_container_width=True, key=f"apply_single_types_{target_table}", disabled=not selected_single_sqls)
-                else:
-                    btn_single_lbl = f"🔓 Enable Execution & Apply Fixes ({len(selected_single_sqls)})" if selected_single_sqls else "🔓 Enable Execution & Apply Fixes"
-                    do_single_apply = st.button(btn_single_lbl, type="primary", use_container_width=True, key=f"unlock_apply_single_{target_table}", disabled=not selected_single_sqls)
-                    if do_single_apply:
-                        st.session_state.is_test_db = True
-
-                if do_single_apply and selected_single_sqls:
-                    errors = []
-                    with st.spinner(f"Applying {len(selected_single_sqls)} column type modifications…"):
-                        for stmt in selected_single_sqls:
-                            _, err, _ = execute_query(engine, stmt, database=selected_db)
-                            if err:
-                                errors.append(f"{stmt} -> {err}")
+                if non_safe_single:
+                    with st.popover(f"⚠️ Confirm & Apply Fixes ({len(selected_single_sqls)})", use_container_width=True):
+                        st.warning(f"**Safety Confirmation Required**:\nYou have selected **{len(non_safe_single)} migrations** classified as `🟡 Check Growth` or `🔴 High Risk`.")
+                        st.markdown("**Potentially Growing Columns Selected:**")
+                        for stmt, s_obj in non_safe_single:
+                            st.markdown(f"* `{s_obj['column']}`: `{s_obj['current_type']}` → `{s_obj['suggested_type']}`")
+                        
+                        user_conf_single = st.checkbox("I understand the growth risks and have backed up my database.", key=f"single_tbl_conf_chk_{target_table}")
+                        if st.button("🚀 Proceed & Apply Fixes", type="primary", disabled=not user_conf_single, key=f"single_tbl_proceed_{target_table}"):
+                            if not is_test_db:
+                                st.session_state.is_test_db = True
+                            errors = []
+                            with st.spinner(f"Applying {len(selected_single_sqls)} fixes on `{target_table}`…"):
+                                for stmt in selected_single_sqls:
+                                    _, err, _ = execute_query(engine, stmt, database=selected_db)
+                                    if err:
+                                        errors.append(f"{stmt} -> {err}")
+                                    else:
+                                        st.session_state.executed_fixes.add(stmt)
+                            if errors:
+                                for e in errors:
+                                    st.error(e)
                             else:
-                                st.session_state.executed_fixes.add(stmt)
-                    if errors:
-                        for e in errors:
-                            st.error(e)
+                                st.success(f"🎉 Successfully applied {len(selected_single_sqls)} data type optimizations on `{target_table}`!")
+                                st.rerun()
+                else:
+                    if is_test_db:
+                        btn_single_lbl = f"🔧 Apply Selected Type Fixes ({len(selected_single_sqls)})" if selected_single_sqls else "🔧 Apply Selected Type Fixes"
+                        do_single_apply = st.button(btn_single_lbl, type="primary", use_container_width=True, key=f"apply_single_types_{target_table}", disabled=not selected_single_sqls)
                     else:
-                        st.success(f"🎉 Successfully applied {len(selected_single_sqls)} data type optimizations on `{target_table}`!")
-                        # Refresh database-wide cache
-                        results = scan_database_column_types(engine, selected_db, deep_verify=True)
-                        st.session_state[db_cache_key] = results
-                        st.session_state[db_sql_cache_key] = generate_database_type_migration_script(engine, results, selected_db)
-                        st.rerun()
+                        btn_single_lbl = f"🔓 Enable Execution & Apply Fixes ({len(selected_single_sqls)})" if selected_single_sqls else "🔓 Enable Execution & Apply Fixes"
+                        do_single_apply = st.button(btn_single_lbl, type="primary", use_container_width=True, key=f"unlock_apply_single_{target_table}", disabled=not selected_single_sqls)
+                        if do_single_apply:
+                            st.session_state.is_test_db = True
+
+                    if do_single_apply and selected_single_sqls:
+                        errors = []
+                        with st.spinner(f"Applying {len(selected_single_sqls)} fixes on `{target_table}`…"):
+                            for stmt in selected_single_sqls:
+                                _, err, _ = execute_query(engine, stmt, database=selected_db)
+                                if err:
+                                    errors.append(f"{stmt} -> {err}")
+                                else:
+                                    st.session_state.executed_fixes.add(stmt)
+                        if errors:
+                            for e in errors:
+                                st.error(e)
+                        else:
+                            st.success(f"🎉 Successfully applied {len(selected_single_sqls)} data type optimizations on `{target_table}`!")
+                            st.rerun()
 
             with sb_c2:
                 if not is_test_db:
-                    st.caption("🔒 **Execution Mode is OFF** (Read-Only Guardrail). Clicking the button above will enable execution mode and apply your selected migrations directly.")
+                    st.caption("🔒 **Execution Mode is OFF** (Read-Only Guardrail). Clicking above will enable execution mode and apply your selected migrations directly.")
                 else:
                     st.caption(f"⚡ **Execution Mode is ACTIVE**. Click above to apply all {len(selected_single_sqls)} selected DDL migrations.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 3: Complete Database Migration Script
+# Tab 3: Full Database Migration Script
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_script:
-    st.markdown("### 📜 Database-Wide Type Optimization Script")
-    st.caption("Consolidated DDL migration script generated directly from your database scan and AI semantic double-check.")
+    st.markdown("### 📜 Full Database Migration Script Generator")
+    st.caption("Generates a combined, production-safe SQL DDL script for all recommended data type optimizations across the entire schema.")
 
-    all_db_suggs = st.session_state.get(db_cache_key)
-    db_ai_audit_map = st.session_state.get(db_ai_cache_key, {})
+    all_db_suggs_for_script = st.session_state.get(db_cache_key)
 
-    if not all_db_suggs:
-        st.info(f"💡 No database scan has been executed for `{selected_db}` yet.")
-        if st.button("🚀 Scan & Generate Full Database Script", type="primary", key="btn_gen_script_tab3"):
-            progress_bar = st.progress(0, text="Initializing database scan...")
-            
-            def _scan_script_progress(curr, total, tbl_name):
-                progress_bar.progress(curr / total, text=f"Analyzing table ({curr}/{total}): `{tbl_name}`…")
-
-            results = scan_database_column_types(engine, selected_db, deep_verify=True, progress_callback=_scan_script_progress)
-            progress_bar.empty()
-            st.session_state[db_cache_key] = results
-            st.session_state[db_sql_cache_key] = generate_database_type_migration_script(engine, results, selected_db)
-            st.rerun()
+    if not all_db_suggs_for_script:
+        st.info("Run the database scan in Tab 1 to generate the full database migration script.")
     else:
-        # Script Options Toolbar
-        scr_c1, scr_c2 = st.columns([2, 1])
+        db_ai_audit_map = st.session_state.get(db_ai_cache_key, {})
+        has_ai_audit = bool(db_ai_audit_map)
+
+        scr_c1, scr_c2 = st.columns([3, 1])
         with scr_c1:
-            has_ai_audit = bool(db_ai_audit_map)
             filter_mode = st.radio(
                 "Script Generation Mode",
-                ["🛡️ AI-Approved Safe Migrations Only", "📋 All Verified Migrations"] if has_ai_audit else ["📋 All Verified Migrations"],
+                ["🛡️ AI-Approved Safe Migrations Only", "🌐 All Recommended Migrations"],
                 horizontal=True,
-                key="script_filter_mode",
+                index=0 if has_ai_audit else 1,
+                help="AI-Approved mode excludes any column flagged with Caution by the Local AI Auditor."
             )
         with scr_c2:
-            if not has_ai_audit:
-                st.caption("💡 Run **'🤖 Run Database-Wide AI Semantic Audit'** in Tab 1 to enable AI-filtered script generation.")
+            st.write("")
+            ai_approved_only = (filter_mode == "🛡️ AI-Approved Safe Migrations Only")
 
-        ai_only = "AI-Approved" in filter_mode if has_ai_audit else False
-        db_script = generate_database_type_migration_script(
-            engine,
-            all_db_suggs,
-            selected_db,
-            ai_audit_map=db_ai_audit_map if has_ai_audit else None,
-            ai_approved_only=ai_only,
+        script_content = generate_database_type_migration_script(
+            all_db_suggs_for_script,
+            dialect=dialect,
+            database=selected_db,
+            ai_audit_map=db_ai_audit_map,
+            ai_approved_only=ai_approved_only,
         )
 
-        st.success(f"✅ Migration script ready for **`{selected_db}`** ({'AI-Approved Safe Migrations' if ai_only else 'Complete Profile'})!")
+        st.code(script_content, language="sql")
         st.download_button(
-            f"⬇ Download {selected_db}_all_types_migration.sql",
-            db_script,
-            file_name=f"{selected_db}_all_types_migration.sql",
+            "⬇ Download database_type_migrations.sql",
+            script_content,
+            file_name=f"{selected_db}_type_migrations.sql",
             mime="text/plain",
             use_container_width=True,
-            key="btn_download_db_script",
         )
-        st.write("")
-        st.code(db_script, language="sql")
