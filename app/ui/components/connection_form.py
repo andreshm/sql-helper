@@ -436,13 +436,33 @@ def render_connection_sidebar():
                     """,
                     unsafe_allow_html=True,
                 )
-        # ── 5. Safety & Backup Disclaimer ───────────────────────────────────
+        # ── 5. System Doctor & Diagnostics ──────────────────────────────────
+        st.divider()
+        with st.expander("🩺 System Doctor", expanded=False):
+            st.caption("Verify database drivers, keyring security, Ollama, and privacy:")
+            if st.button("Run System Diagnostics", use_container_width=True, key="side_run_doctor"):
+                from app.doctor import run_doctor
+                d_res = run_doctor()
+                total_pass = sum(sum(1 for i in items if i["status"] == "PASS") for items in d_res.values())
+                total_issues = sum(sum(1 for i in items if i["status"] == "FAIL") for items in d_res.values())
+                if total_issues == 0:
+                    st.success(f"🎉 All checks passed ({total_pass} tests)!")
+                else:
+                    st.error(f"⚠️ {total_issues} issues detected.")
+                for sec, items in d_res.items():
+                    st.markdown(f"**{sec.replace('_', ' ').title()}**")
+                    for it in items:
+                        badge = "🟢" if it["status"] == "PASS" else ("🟡" if it["status"] in ("WARN", "INFO") else "🔴")
+                        st.caption(f"{badge} **{it['name']}**: {it.get('message', '')}")
+
+        # ── 6. Safety & Backup Disclaimer ───────────────────────────────────
         st.divider()
         with st.expander("🛡️ Safety & Backup Notice", expanded=False):
             st.caption(
                 "**MANDATORY NOTICE**: You are responsible for ensuring current, verified backups prior to executing DDL optimizations. "
                 "This tool is provided AS IS. The authors assume zero liability for data loss or downtime."
             )
+
 
         # ── 6. Shut Down / Quit Server Button ────────────────────────────────
         st.divider()

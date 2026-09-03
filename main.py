@@ -1,5 +1,12 @@
 import os
+import sys
 import time
+
+if len(sys.argv) > 1 and sys.argv[1].lower() in ("doctor", "--doctor", "-d"):
+    from app.doctor import print_doctor_report
+    print_doctor_report()
+    sys.exit(0)
+
 import streamlit as st
 import pandas as pd
 from pathlib import Path
@@ -20,6 +27,7 @@ from app.db.connections import (
     is_disclaimer_accepted,
     set_disclaimer_accepted,
 )
+
 
 st.set_page_config(
     page_title="SQL Helper — Database Workspace",

@@ -192,9 +192,20 @@ SELECT * FROM orders WHERE status = 'pending' AND customer_id = 42 ORDER BY crea
 
         clear_index_change_history("test_db")
 
+    def test_doctor_diagnostics(self):
+        from app.doctor import run_doctor
+        results = run_doctor()
+        self.assertIn("environment", results)
+        self.assertIn("database_drivers", results)
+        self.assertIn("security_and_keyring", results)
+        self.assertIn("privacy_and_git", results)
+        # Check that environment passed
+        self.assertEqual(results["environment"][0]["status"], "PASS")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
